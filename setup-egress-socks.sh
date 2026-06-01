@@ -42,15 +42,17 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# Embedded upstream SOCKS5 endpoint.
-# Edit these four lines, or override via env vars of the same name when
-# invoking the installer, e.g.
-#   sudo BUILTIN_PROXY_HOST=1.2.3.4 ... bash setup-egress-socks.sh
+# Upstream SOCKS5 endpoint.
+# Prefer passing a full URL, or enter it interactively on first install:
+#   sudo BUILTIN_PROXY_URL='socks5://user:pass@1.2.3.4:6013' bash setup-egress-socks.sh
+# Legacy split env vars are still supported:
+#   sudo BUILTIN_PROXY_HOST=1.2.3.4 BUILTIN_PROXY_PORT=6013 ... bash setup-egress-socks.sh
 # -----------------------------------------------------------------------------
-BUILTIN_PROXY_HOST="${BUILTIN_PROXY_HOST:-202.156.27.84}"
-BUILTIN_PROXY_PORT="${BUILTIN_PROXY_PORT:-6013}"
-BUILTIN_PROXY_USER="${BUILTIN_PROXY_USER:-pf-zjrr7g4j1tcv}"
-BUILTIN_PROXY_PASS="${BUILTIN_PROXY_PASS:-NQF6nsFqGYELnVT2}"
+BUILTIN_PROXY_URL="${BUILTIN_PROXY_URL:-}"
+BUILTIN_PROXY_HOST="${BUILTIN_PROXY_HOST:-}"
+BUILTIN_PROXY_PORT="${BUILTIN_PROXY_PORT:-}"
+BUILTIN_PROXY_USER="${BUILTIN_PROXY_USER:-}"
+BUILTIN_PROXY_PASS="${BUILTIN_PROXY_PASS:-}"
 
 # -----------------------------------------------------------------------------
 # Network defaults (env-overridable).
@@ -66,6 +68,8 @@ NODE_SSH_PORT="${NODE_SSH_PORT:-$DETECTED_SSH_PORT}"
 INCUS_API_PORT="${INCUS_API_PORT:-8443}"
 PORT_RANGE_LOW="${PORT_RANGE_LOW:-20000}"
 PORT_RANGE_HIGH="${PORT_RANGE_HIGH:-30000}"
+BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-1.1.1.1}"
+TUN_IPV6="${TUN_IPV6:-0}"
 
 # -----------------------------------------------------------------------------
 # Internals — generally don't need editing.
@@ -125,19 +129,27 @@ valid_port() {
 
 validate_inputs() {
   local name value
-  for name in BUILTIN_PROXY_PORT NODE_SSH_PORT INCUS_API_PORT PORT_RANGE_LOW PORT_RANGE_HIGH; do
+  for name in NODE_SSH_PORT INCUS_API_PORT PORT_RANGE_LOW PORT_RANGE_HIGH; do
     value="${!name}"
     if ! valid_port "$value"; then
       echo "配置错误：$name 不是合法端口：$value" >&2
       exit 1
     fi
   done
+  if [[ -n "$BUILTIN_PROXY_PORT" ]] && ! valid_port "$BUILTIN_PROXY_PORT"; then
+    echo "配置错误：BUILTIN_PROXY_PORT 不是合法端口：$BUILTIN_PROXY_PORT" >&2
+    exit 1
+  fi
   if (( PORT_RANGE_LOW > PORT_RANGE_HIGH )); then
     echo "配置错误：PORT_RANGE_LOW 不能大于 PORT_RANGE_HIGH" >&2
     exit 1
   fi
-  if [[ -z "$BUILTIN_PROXY_HOST" || -z "$TUN_NAME" || -z "$INCUS_BRIDGE" || -z "$INCUS_SUBNET" ]]; then
-    echo "配置错误：BUILTIN_PROXY_HOST / TUN_NAME / INCUS_BRIDGE / INCUS_SUBNET 不能为空" >&2
+  if [[ -z "$TUN_NAME" || -z "$INCUS_BRIDGE" || -z "$INCUS_SUBNET" || -z "$BOOTSTRAP_DNS" ]]; then
+    echo "配置错误：TUN_NAME / INCUS_BRIDGE / INCUS_SUBNET / BOOTSTRAP_DNS 不能为空" >&2
+    exit 1
+  fi
+  if [[ "$TUN_IPV6" != "0" && "$TUN_IPV6" != "1" ]]; then
+    echo "配置错误：TUN_IPV6 只能是 0 或 1" >&2
     exit 1
   fi
 }
@@ -256,22 +268,42 @@ ensure_proxy_store() {
   chmod 700 "$STATE_DIR"
 
   if [[ ! -s "$PROXY_LIST_FILE" ]]; then
+    local raw="${BUILTIN_PROXY_URL:-}"
+    if [[ -z "$raw" && -n "$BUILTIN_PROXY_HOST" && -n "$BUILTIN_PROXY_PORT" && -n "$BUILTIN_PROXY_USER" && -n "$BUILTIN_PROXY_PASS" ]]; then
+      raw="socks5://${BUILTIN_PROXY_USER}:${BUILTIN_PROXY_PASS}@${BUILTIN_PROXY_HOST}:${BUILTIN_PROXY_PORT}"
+    fi
+    if [[ -z "$raw" ]]; then
+      if [[ ! -t 0 ]]; then
+        echo "未配置上游 SOCKS5。请用 BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' 运行，或交互式执行脚本。" >&2
+        exit 1
+      fi
+      echo "未检测到上游 SOCKS5，首次安装需要输入家宽端输出的地址。"
+      read -r -p "请输入 SOCKS5 (socks5://用户名:密码@地址:端口): " raw
+    fi
     PROXY_LIST_FILE="$PROXY_LIST_FILE" \
-    BUILTIN_PROXY_HOST="$BUILTIN_PROXY_HOST" \
-    BUILTIN_PROXY_PORT="$BUILTIN_PROXY_PORT" \
-    BUILTIN_PROXY_USER="$BUILTIN_PROXY_USER" \
-    BUILTIN_PROXY_PASS="$BUILTIN_PROXY_PASS" \
+    RAW_PROXY="$raw" \
     python3 - <<'PY'
 import json
 import os
+import urllib.parse
 
 path = os.environ["PROXY_LIST_FILE"]
+raw = os.environ["RAW_PROXY"].strip().replace("：", ":")
+if "://" not in raw:
+    raw = "socks5://" + raw
+url = urllib.parse.urlparse(raw)
+if url.scheme != "socks5":
+    raise SystemExit("只支持 socks5:// 或 用户名:密码@地址:端口")
+if not url.hostname or not url.port:
+    raise SystemExit("格式错误，应为 socks5://用户名:密码@地址:端口")
+if not url.username or url.password is None:
+    raise SystemExit("格式错误，必须包含用户名和密码")
 item = {
     "name": "builtin",
-    "host": os.environ["BUILTIN_PROXY_HOST"],
-    "port": int(os.environ["BUILTIN_PROXY_PORT"]),
-    "username": os.environ["BUILTIN_PROXY_USER"],
-    "password": os.environ["BUILTIN_PROXY_PASS"],
+    "host": url.hostname,
+    "port": int(url.port),
+    "username": urllib.parse.unquote(url.username),
+    "password": urllib.parse.unquote(url.password or ""),
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump([item], f, ensure_ascii=False, indent=2)
@@ -284,6 +316,38 @@ PY
     printf '0\n' > "$ACTIVE_PROXY_FILE"
     chmod 600 "$ACTIVE_PROXY_FILE"
   fi
+}
+
+active_proxy_url() {
+  load_active_proxy
+  ACTIVE_PROXY_HOST="$ACTIVE_PROXY_HOST" \
+  ACTIVE_PROXY_PORT="$ACTIVE_PROXY_PORT" \
+  ACTIVE_PROXY_USER="$ACTIVE_PROXY_USER" \
+  ACTIVE_PROXY_PASS="$ACTIVE_PROXY_PASS" \
+  python3 - <<'PY'
+import os
+import urllib.parse
+
+user = urllib.parse.quote(os.environ["ACTIVE_PROXY_USER"], safe="")
+password = urllib.parse.quote(os.environ["ACTIVE_PROXY_PASS"], safe="")
+host = os.environ["ACTIVE_PROXY_HOST"]
+port = os.environ["ACTIVE_PROXY_PORT"]
+print(f"socks5h://{user}:{password}@{host}:{port}")
+PY
+}
+
+test_active_proxy_direct() {
+  local proxy_url out
+  proxy_url="$(active_proxy_url)"
+  out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" https://ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" https://ip.sb 2>/dev/null || true)"
+  fi
+  if [[ -z "$out" ]]; then
+    echo "上游 SOCKS5 真实连通性测试失败，请确认地址、端口、账号密码和家宽防火墙。" >&2
+    return 1
+  fi
+  echo "  上游 SOCKS5 测试通过，代理出口 IP: $out"
 }
 
 load_active_proxy() {
@@ -332,18 +396,34 @@ write_singbox_config() {
   fi
 
   echo "  上游 SOCKS5 #$((ACTIVE_PROXY_INDEX + 1)): ${ACTIVE_PROXY_USER:+$ACTIVE_PROXY_USER@}$proxy_ip:$ACTIVE_PROXY_PORT"
+  test_active_proxy_direct
 
   python3 - \
     "$CONFIG_FILE" "$proxy_ip" "$ACTIVE_PROXY_PORT" \
     "$ACTIVE_PROXY_USER" "$ACTIVE_PROXY_PASS" \
     "$TUN_NAME" "$TUN_ADDR4" "$TUN_ADDR6" "$INCUS_SUBNET" \
-    "$SINGBOX_TABLE_INDEX" "$SINGBOX_RULE_INDEX" \
+    "$SINGBOX_TABLE_INDEX" "$SINGBOX_RULE_INDEX" "$BOOTSTRAP_DNS" "$TUN_IPV6" \
 <<'PY'
 import json
 import sys
 
 (_, cfg_path, proxy_ip, proxy_port, proxy_user, proxy_pass,
- tun_name, tun_addr4, tun_addr6, incus_subnet, table_idx, rule_idx) = sys.argv
+ tun_name, tun_addr4, tun_addr6, incus_subnet, table_idx, rule_idx,
+ bootstrap_dns, tun_ipv6) = sys.argv
+
+enable_ipv6 = tun_ipv6 == "1"
+tun_addresses = [tun_addr4]
+if enable_ipv6:
+    tun_addresses.append(tun_addr6)
+excluded_cidrs = [
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    incus_subnet,
+]
+if enable_ipv6:
+    excluded_cidrs.extend(["::1/128", "fe80::/10", "ff00::/8"])
 
 cfg = {
     "log": {"level": "info", "timestamp": True},
@@ -355,7 +435,7 @@ cfg = {
             {
                 "type": "udp",
                 "tag": "local-dns",
-                "server": "1.1.1.1",
+                "server": bootstrap_dns,
                 "detour": "direct",
             },
             # Proxied resolver: DNS-over-HTTPS to 1.1.1.1 through SOCKS5.
@@ -376,7 +456,7 @@ cfg = {
             "type": "tun",
             "tag": "tun-in",
             "interface_name": tun_name,
-            "address": [tun_addr4, tun_addr6],
+            "address": tun_addresses,
             "mtu": 1500,
             "auto_route": True,
             "iproute2_table_index": int(table_idx),
@@ -386,16 +466,7 @@ cfg = {
             # Don't claim routes for these — let the kernel keep using the
             # original connected / loopback routes. Crucially this includes
             # the Incus bridge subnet so host↔guest stays on incusbr0.
-            "route_exclude_address": [
-                "127.0.0.0/8",
-                "::1/128",
-                "169.254.0.0/16",
-                "fe80::/10",
-                "224.0.0.0/4",
-                "ff00::/8",
-                "240.0.0.0/4",
-                incus_subnet,
-            ],
+            "route_exclude_address": excluded_cidrs,
         }
     ],
     "outbounds": [
@@ -437,14 +508,7 @@ cfg = {
             # direct rather than the proxy.
             {
                 "ip_cidr": [
-                    "127.0.0.0/8",
-                    "::1/128",
-                    "169.254.0.0/16",
-                    "fe80::/10",
-                    "224.0.0.0/4",
-                    "ff00::/8",
-                    "240.0.0.0/4",
-                    incus_subnet,
+                    *excluded_cidrs,
                     f"{proxy_ip}/32",
                 ],
                 "action": "route",
@@ -637,15 +701,8 @@ ensure_proxy_store() {
   if [[ ! -s "$PROXY_LIST_FILE" ]]; then
     python3 - <<'PY'
 import json
-items = [{
-    "name": "builtin",
-    "host": "202.156.27.84",
-    "port": 6013,
-    "username": "pf-zjrr7g4j1tcv",
-    "password": "NQF6nsFqGYELnVT2",
-}]
 with open("/etc/egress-socks/proxies.json", "w", encoding="utf-8") as f:
-    json.dump(items, f, ensure_ascii=False, indent=2)
+    json.dump([], f, ensure_ascii=False, indent=2)
     f.write("\n")
 PY
     chmod 600 "$PROXY_LIST_FILE"
@@ -664,6 +721,9 @@ import os
 
 with open(os.environ["PROXY_LIST_FILE"], "r", encoding="utf-8") as f:
     items = json.load(f)
+if not items:
+    print("SOCKS5 出口列表为空，请先执行: sudo zck proxy add socks5://用户名:密码@地址:端口")
+    raise SystemExit(0)
 try:
     active = int(open(os.environ["ACTIVE_PROXY_FILE"], "r", encoding="utf-8").read().strip() or "0")
 except Exception:
@@ -704,6 +764,11 @@ try:
     socket.getaddrinfo(url.hostname, url.port, socket.AF_INET, socket.SOCK_STREAM)
 except socket.gaierror as exc:
     raise SystemExit(f"无法解析/验证 IPv4：{url.hostname}: {exc}") from exc
+try:
+    with socket.create_connection((url.hostname, url.port), timeout=5):
+        pass
+except OSError as exc:
+    raise SystemExit(f"SOCKS5 TCP 端口不可达：{url.hostname}:{url.port} ({exc})") from exc
 
 item = {
     "name": f"{url.hostname}:{url.port}",
@@ -728,6 +793,53 @@ else:
     print(f"已添加：#{len(items)} {item['username']}@{item['host']}:{item['port']}")
 PY
   chmod 600 "$PROXY_LIST_FILE"
+}
+
+active_one_based() {
+  ensure_proxy_store
+  python3 - <<'PY'
+try:
+    active = int(open("/etc/egress-socks/active_proxy", "r", encoding="utf-8").read().strip() or "0")
+except Exception:
+    active = 0
+print(active + 1)
+PY
+}
+
+test_current_egress() {
+  local out
+  out=$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me 2>/dev/null || true)
+  if [[ -z "$out" ]]; then
+    out=$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ip.sb 2>/dev/null || true)
+  fi
+  if [[ -z "$out" ]]; then
+    echo "出口测试失败"
+    return 1
+  fi
+  echo "出口 IP: $out"
+}
+
+switch_with_rollback() {
+  local n="$1"
+  local old
+  old="$(active_one_based)"
+  proxy_apply_index "$n"
+  sing-box check -c "$CONFIG_FILE"
+  if systemctl --quiet is-active sing-box; then
+    systemctl restart sing-box
+    sleep 2
+    if test_current_egress; then
+      echo "sing-box 已重启，当前出口已切换。"
+    else
+      echo "新 SOCKS5 出口不可用，回滚到 #$old ..."
+      proxy_apply_index "$old"
+      sing-box check -c "$CONFIG_FILE"
+      systemctl restart sing-box
+      return 1
+    fi
+  else
+    echo "sing-box 当前未运行；配置已更新，下次启动生效。"
+  fi
 }
 
 proxy_apply_index() {
@@ -800,10 +912,7 @@ proxy_switch() {
     echo "序号无效"
     return 1
   fi
-  proxy_apply_index "$n"
-  sing-box check -c "$CONFIG_FILE"
-  systemctl restart sing-box
-  systemctl --no-pager --quiet is-active sing-box && echo "sing-box 已重启，当前出口已切换。"
+  switch_with_rollback "$n"
 }
 
 proxy_delete() {
@@ -894,10 +1003,7 @@ cmd_proxy() {
       ;;
     switch|use)
       if [[ -n "${2:-}" ]]; then
-        proxy_apply_index "$2"
-        sing-box check -c "$CONFIG_FILE"
-        systemctl restart sing-box
-        echo "sing-box 已重启，当前出口已切换。"
+        switch_with_rollback "$2"
       else
         proxy_switch
       fi
@@ -1063,10 +1169,14 @@ enable_and_verify() {
   log "[6/6] 启动服务并校验"
 
   sysctl -w net.ipv4.ip_forward=1               >/dev/null 2>&1 || true
-  sysctl -w net.ipv6.conf.all.forwarding=1      >/dev/null 2>&1 || true
-  cat > /etc/sysctl.d/99-egress-socks.conf <<'SYSCTL'
+  if [[ "$TUN_IPV6" == "1" ]]; then
+    sysctl -w net.ipv6.conf.all.forwarding=1    >/dev/null 2>&1 || true
+  else
+    sysctl -w net.ipv6.conf.all.forwarding=0    >/dev/null 2>&1 || true
+  fi
+  cat > /etc/sysctl.d/99-egress-socks.conf <<SYSCTL
 net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.all.forwarding=${TUN_IPV6}
 SYSCTL
 
   systemctl enable --now egress-bypass.service
@@ -1135,6 +1245,18 @@ SYSCTL
     echo "  [OK]   TUN $TUN_NAME 已建立"
   else
     echo "  [FAIL] TUN $TUN_NAME 未建立"; ok=0
+  fi
+
+  local egress_ip
+  egress_ip="$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me 2>/dev/null || true)"
+  if [[ -z "$egress_ip" ]]; then
+    egress_ip="$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ip.sb 2>/dev/null || true)"
+  fi
+  if [[ -n "$egress_ip" ]]; then
+    echo "  [OK]   真实出口测试通过: $egress_ip"
+  else
+    echo "  [FAIL] 真实出口测试失败；90 秒回滚保险不会解除"
+    ok=0
   fi
 
   echo

@@ -58,6 +58,13 @@ socks5://用户名:密码@地址:端口
 普通机器接入该 SOCKS5：
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-egress-socks.sh -o setup-egress-socks.sh
+sudo BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' bash setup-egress-socks.sh
+```
+
+已安装后切换 SOCKS5：
+
+```bash
 sudo zck proxy add 'socks5://用户名:密码@地址:端口'
 sudo zck proxy switch
 sudo zck test
