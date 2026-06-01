@@ -23,13 +23,18 @@ OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
 detect_outer_mtu() {
   local target="$1"
   local payload
+  if ! command -v ping >/dev/null 2>&1; then
+    echo 1200
+    return 0
+  fi
   for payload in 1372 1360 1320 1280 1240 1200 1160 1120 1080; do
-    if timeout 4 ping -4 -c 2 -W 1 -M do -s "$payload" "$target" 2>/dev/null | grep -q ' 0% packet loss'; then
+    if timeout 4 ping -4 -c 1 -W 1 -M do -s "$payload" "$target" >/dev/null 2>&1; then
       echo $((payload + 28))
-      return
+      return 0
     fi
   done
   echo 1200
+  return 0
 }
 
 auto_tune_mtu() {
@@ -71,7 +76,7 @@ ip -4 route flush cache 2>/dev/null || true
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq wireguard iproute2 curl iptables ca-certificates
+apt-get install -y -qq wireguard iproute2 curl iptables ca-certificates iputils-ping
 
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 GATEWAY="$(ip -4 route show default | awk '/default/ {print $3; exit}')"

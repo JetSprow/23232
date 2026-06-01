@@ -23,15 +23,20 @@ WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 
 detect_outer_mtu() {
   local target payload
+  if ! command -v ping >/dev/null 2>&1; then
+    echo 1200
+    return 0
+  fi
   for target in $MTU_PROBE_TARGETS; do
     for payload in 1372 1360 1320 1280 1240 1200 1160 1120 1080; do
-      if timeout 4 ping -4 -c 2 -W 1 -M do -s "$payload" "$target" 2>/dev/null | grep -q ' 0% packet loss'; then
+      if timeout 4 ping -4 -c 1 -W 1 -M do -s "$payload" "$target" >/dev/null 2>&1; then
         echo $((payload + 28))
-        return
+        return 0
       fi
     done
   done
   echo 1200
+  return 0
 }
 
 auto_tune_mtu() {
@@ -68,7 +73,7 @@ echo "==> WireGuard 监听: UDP $WG_PORT"
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq wireguard iptables iptables-persistent curl
+apt-get install -y -qq wireguard iptables iptables-persistent curl iputils-ping
 
 echo "==> 预写 dnsmasq 配置，避免安装阶段抢占 53 端口"
 mkdir -p /etc/dnsmasq.d
