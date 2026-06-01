@@ -566,12 +566,16 @@ table inet egress-bypass {
   chain prerouting {
     # Use conntrack mark instead of guessing reply source ports. On a
     # DNATed port-forward flow, the reply from a guest usually enters the
-    # host with the guest's real source port (e.g. 80), not the public
-    # mapped port (e.g. 25000). We mark the original inbound connection
-    # by public dport, then restore that mark on all packets in the flow.
+    # host with the guest's real source port (e.g. 22), not the public
+    # mapped port. Mark every NEW connection that enters from outside the
+    # Incus bridge/TUN, then restore that mark on all packets in the flow.
+    # This keeps SSH/API/user-forward replies on the original route even
+    # when the public forwarding port is outside PORT_RANGE_LOW/HIGH.
     type filter hook prerouting priority mangle; policy accept;
 
     ct mark ${BYPASS_MARK_HEX} meta mark set ${BYPASS_MARK_HEX}
+
+    iifname != "${INCUS_BRIDGE}" iifname != "${TUN_NAME}" ct state new ct mark set ${BYPASS_MARK_HEX} meta mark set ${BYPASS_MARK_HEX}
 
     iifname != "${INCUS_BRIDGE}" meta l4proto tcp tcp dport { ${NODE_SSH_PORT}, ${INCUS_API_PORT} } ct mark set ${BYPASS_MARK_HEX} meta mark set ${BYPASS_MARK_HEX}
     iifname != "${INCUS_BRIDGE}" meta l4proto tcp tcp dport ${PORT_RANGE_LOW}-${PORT_RANGE_HIGH} ct mark set ${BYPASS_MARK_HEX} meta mark set ${BYPASS_MARK_HEX}
