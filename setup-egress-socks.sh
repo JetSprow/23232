@@ -267,11 +267,15 @@ ensure_proxy_store() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  if [[ ! -s "$PROXY_LIST_FILE" ]]; then
-    local raw="${BUILTIN_PROXY_URL:-}"
-    if [[ -z "$raw" && -n "$BUILTIN_PROXY_HOST" && -n "$BUILTIN_PROXY_PORT" && -n "$BUILTIN_PROXY_USER" && -n "$BUILTIN_PROXY_PASS" ]]; then
-      raw="socks5://${BUILTIN_PROXY_USER}:${BUILTIN_PROXY_PASS}@${BUILTIN_PROXY_HOST}:${BUILTIN_PROXY_PORT}"
-    fi
+  local raw="${BUILTIN_PROXY_URL:-}"
+  if [[ -z "$raw" && -n "$BUILTIN_PROXY_HOST" && -n "$BUILTIN_PROXY_PORT" && -n "$BUILTIN_PROXY_USER" && -n "$BUILTIN_PROXY_PASS" ]]; then
+    raw="socks5://${BUILTIN_PROXY_USER}:${BUILTIN_PROXY_PASS}@${BUILTIN_PROXY_HOST}:${BUILTIN_PROXY_PORT}"
+  fi
+
+  # Explicit proxy input on install should override stale state from a
+  # previous run. Without this, rerunning with BUILTIN_PROXY_URL keeps testing
+  # the old /etc/egress-socks/proxies.json entry.
+  if [[ -n "$raw" || ! -s "$PROXY_LIST_FILE" ]]; then
     if [[ -z "$raw" ]]; then
       if [[ ! -t 0 ]]; then
         echo "未配置上游 SOCKS5。请用 BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' 运行，或交互式执行脚本。" >&2
@@ -312,6 +316,8 @@ with open(path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
     chmod 600 "$PROXY_LIST_FILE"
+    printf '0\n' > "$ACTIVE_PROXY_FILE"
+    chmod 600 "$ACTIVE_PROXY_FILE"
   fi
 
   if [[ ! -s "$ACTIVE_PROXY_FILE" ]]; then
