@@ -13,10 +13,10 @@ WG_PORT="${WG_PORT:-}"
 WG_NET="10.0.0.0/24"
 WG_SERVER_IP="10.0.0.1"
 WG_CLIENT_IP="10.0.0.2"
-WG_MTU_REQUEST="${WG_MTU:-auto}"
-TCP_MSS_REQUEST="${TCP_MSS:-auto}"
-WG_MTU="1280"
-TCP_MSS="1240"
+WG_MTU_REQUEST="${WG_MTU:-1180}"
+TCP_MSS_REQUEST="${TCP_MSS:-1140}"
+WG_MTU="1180"
+TCP_MSS="1140"
 MTU_PROBE_TARGETS="${MTU_PROBE_TARGETS:-185.199.108.133 1.1.1.1 8.8.8.8}"
 OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
@@ -61,6 +61,15 @@ auto_tune_mtu() {
   fi
   set -e
   return 0
+}
+
+set_mtu_mss() {
+  if [[ "${AUTO_MTU_PROBE:-0}" == "1" ]]; then
+    auto_tune_mtu
+    return 0
+  fi
+  [[ "$WG_MTU_REQUEST" =~ ^[0-9]+$ ]] && WG_MTU="$WG_MTU_REQUEST"
+  [[ "$TCP_MSS_REQUEST" =~ ^[0-9]+$ ]] && TCP_MSS="$TCP_MSS_REQUEST"
 }
 
 if [[ -z "$WG_PORT" ]]; then
@@ -197,8 +206,8 @@ for old_mss in $OLD_MSS_VALUES; do
 done
 while iptables -t nat -D POSTROUTING -o "${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
 
-echo "==> 自动探测 WireGuard MTU/MSS"
-auto_tune_mtu
+echo "==> 设置 WireGuard MTU/MSS"
+set_mtu_mss
 echo "    MTU = ${WG_MTU}, TCP MSS = ${TCP_MSS}"
 
 echo

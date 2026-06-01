@@ -14,10 +14,10 @@ WG_PORT_DEFAULT="51820"
 DNS_VIA_TUNNEL="10.0.0.1"
 WG_TABLE="51820"
 WG_FWMARK="51820"
-WG_MTU_REQUEST="${WG_MTU:-auto}"
-TCP_MSS_REQUEST="${TCP_MSS:-auto}"
-WG_MTU="1280"
-TCP_MSS="1240"
+WG_MTU_REQUEST="${WG_MTU:-1180}"
+TCP_MSS_REQUEST="${TCP_MSS:-1140}"
+WG_MTU="1180"
+TCP_MSS="1140"
 DNS_HELPER="/usr/local/sbin/wg-ipv4-dns"
 OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
 
@@ -60,6 +60,15 @@ auto_tune_mtu() {
   fi
   set -e
   return 0
+}
+
+set_mtu_mss() {
+  if [[ "${AUTO_MTU_PROBE:-0}" == "1" ]]; then
+    auto_tune_mtu "$1"
+    return 0
+  fi
+  [[ "$WG_MTU_REQUEST" =~ ^[0-9]+$ ]] && WG_MTU="$WG_MTU_REQUEST"
+  [[ "$TCP_MSS_REQUEST" =~ ^[0-9]+$ ]] && TCP_MSS="$TCP_MSS_REQUEST"
 }
 
 echo "==> 预清理旧 WireGuard 路由，避免安装阶段没网"
@@ -174,8 +183,8 @@ fi
 [[ -n "$HOME_ENDPOINT_IPV4" ]] || { echo "无法解析家宽 VPS 的 IPv4 A 记录"; exit 1; }
 echo "    家宽 Endpoint IPv4 = ${HOME_ENDPOINT_IPV4}:${HOME_PORT}"
 
-echo "==> 自动探测 WireGuard MTU/MSS"
-auto_tune_mtu "$HOME_ENDPOINT_IPV4"
+echo "==> 设置 WireGuard MTU/MSS"
+set_mtu_mss "$HOME_ENDPOINT_IPV4"
 echo "    MTU = ${WG_MTU}, TCP MSS = ${TCP_MSS}"
 
 echo "==> 写入 DNS 切换助手"
