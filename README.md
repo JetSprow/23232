@@ -49,6 +49,12 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-sock
 sudo bash setup-home-socks5.sh
 ```
 
+如果家宽机器的“出口 IP”和普通机器能连到的“入口 IP/域名”不一致，必须指定入口地址：
+
+```bash
+sudo SOCKS_HOST=你的入口IP或域名 SOCKS_PORT=端口 bash setup-home-socks5.sh
+```
+
 脚本会输出：
 
 ```text

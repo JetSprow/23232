@@ -4,6 +4,7 @@
 # 用法: sudo bash setup-home-socks5.sh
 # 可选:
 #   sudo SOCKS_PORT=6013 bash setup-home-socks5.sh
+#   sudo SOCKS_HOST=home.example.com SOCKS_PORT=6013 bash setup-home-socks5.sh
 #   sudo SOCKS_PORT=6013 SOCKS_USER=myuser SOCKS_PASS=mypass bash setup-home-socks5.sh
 set -euo pipefail
 trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
@@ -33,6 +34,12 @@ if [[ -z "$SOCKS_PORT" ]]; then
   SOCKS_PORT="${SOCKS_PORT:-6013}"
 fi
 valid_port "$SOCKS_PORT" || { echo "SOCKS5 端口无效: $SOCKS_PORT"; exit 1; }
+
+if [[ -z "$SOCKS_HOST" && -t 0 ]]; then
+  echo "SOCKS5 对外连接地址应填写普通机器能连到的入口 IP/域名。"
+  echo "如果家宽出口 IP 和入口 IP 不一致，不要填写 curl/ip.sb 看到的出口 IP。"
+  read -rp "SOCKS5 对外连接地址/域名 [留空自动检测]: " SOCKS_HOST
+fi
 
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
@@ -121,6 +128,10 @@ if [[ -z "$SOCKS_HOST" ]]; then
   SOCKS_HOST="$(curl -4 -fsS --connect-timeout 4 --max-time 8 https://ifconfig.me 2>/dev/null | tr -d '\r\n' || true)"
 fi
 SOCKS_HOST="${SOCKS_HOST:-$LOCAL_IP}"
+if [[ "$SOCKS_HOST" == "$LOCAL_IP" ]]; then
+  echo "    [!] 未提供对外入口地址，已临时使用本机地址 ${SOCKS_HOST}。"
+  echo "        如果普通机器不能连接这个地址，请重新运行并设置 SOCKS_HOST=入口IP或域名。"
+fi
 
 SOCKS_URL="socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_HOST}:${SOCKS_PORT}"
 
