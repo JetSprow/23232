@@ -37,7 +37,7 @@ valid_port "$SOCKS_PORT" || { echo "SOCKS5 端口无效: $SOCKS_PORT"; exit 1; }
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq dante-server curl ca-certificates openssl
+apt-get install -y -qq dante-server curl ca-certificates openssl iptables
 
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 LOCAL_IP="$(ip -4 -o addr show dev "$WAN_IF" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
@@ -94,8 +94,12 @@ socks pass {
 EOF
 
 echo "==> 放行本机防火墙端口"
-iptables -C INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null || \
-  iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT
+else
+  echo "    [!] 未找到 iptables，跳过本机防火墙放行。请确认系统/云防火墙已放行 TCP ${SOCKS_PORT}。"
+fi
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "${SOCKS_PORT}/tcp" >/dev/null || true
 fi
