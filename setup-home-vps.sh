@@ -12,10 +12,46 @@ WG_PORT="${WG_PORT:-}"
 WG_NET="10.0.0.0/24"
 WG_SERVER_IP="10.0.0.1"
 WG_CLIENT_IP="10.0.0.2"
+WG_MTU_REQUEST="${WG_MTU:-auto}"
+TCP_MSS_REQUEST="${TCP_MSS:-auto}"
 WG_MTU="1280"
 TCP_MSS="1240"
+MTU_PROBE_TARGETS="${MTU_PROBE_TARGETS:-185.199.108.133 1.1.1.1 8.8.8.8}"
+OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 [[ -n "$WAN_IF" ]] || { echo "无法识别默认网卡"; exit 1; }
+
+detect_outer_mtu() {
+  local target payload
+  for target in $MTU_PROBE_TARGETS; do
+    for payload in 1372 1360 1320 1280 1240 1200 1160 1120 1080; do
+      if timeout 4 ping -4 -c 2 -W 1 -M do -s "$payload" "$target" 2>/dev/null | grep -q ' 0% packet loss'; then
+        echo $((payload + 28))
+        return
+      fi
+    done
+  done
+  echo 1200
+}
+
+auto_tune_mtu() {
+  if [[ "$WG_MTU_REQUEST" != "auto" ]]; then
+    WG_MTU="$WG_MTU_REQUEST"
+  else
+    local outer_mtu
+    outer_mtu="$(detect_outer_mtu)"
+    WG_MTU=$((outer_mtu - 80))
+    (( WG_MTU > 1280 )) && WG_MTU=1280
+    (( WG_MTU < 1080 )) && WG_MTU=1080
+  fi
+
+  if [[ "$TCP_MSS_REQUEST" != "auto" ]]; then
+    TCP_MSS="$TCP_MSS_REQUEST"
+  else
+    TCP_MSS=$((WG_MTU - 40))
+    (( TCP_MSS < 1040 )) && TCP_MSS=1040
+  fi
+}
 
 if [[ -z "$WG_PORT" ]]; then
   read -rp "WireGuard 监听端口 [51820]: " WG_PORT
@@ -145,9 +181,15 @@ SERVER_PUB="$(cat server.pub)"
 echo "==> 清理旧版宽泛 iptables 规则"
 while iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; do :; done
-while iptables -t mangle -D FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${TCP_MSS}" 2>/dev/null; do :; done
-while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${TCP_MSS}" 2>/dev/null; do :; done
+for old_mss in $OLD_MSS_VALUES; do
+  while iptables -t mangle -D FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+  while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+done
 while iptables -t nat -D POSTROUTING -o "${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
+
+echo "==> 自动探测 WireGuard MTU/MSS"
+auto_tune_mtu
+echo "    MTU = ${WG_MTU}, TCP MSS = ${TCP_MSS}"
 
 echo
 echo "============================================================"

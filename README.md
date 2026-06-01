@@ -40,6 +40,13 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-normal-vp
 sudo bash setup-normal-vps.sh
 ```
 
+脚本默认自动探测并设置 WireGuard `MTU` 和 TCP `MSS`。如需手动指定：
+
+```bash
+sudo WG_MTU=1180 TCP_MSS=1140 bash setup-normal-vps.sh
+sudo WG_MTU=1180 TCP_MSS=1140 bash setup-home-vps.sh
+```
+
 诊断 GitHub Raw / Check.Place 卡住：
 
 ```bash

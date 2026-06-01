@@ -13,9 +13,44 @@ WG_PORT_DEFAULT="51820"
 DNS_VIA_TUNNEL="10.0.0.1"
 WG_TABLE="51820"
 WG_FWMARK="51820"
+WG_MTU_REQUEST="${WG_MTU:-auto}"
+TCP_MSS_REQUEST="${TCP_MSS:-auto}"
 WG_MTU="1280"
 TCP_MSS="1240"
 DNS_HELPER="/usr/local/sbin/wg-ipv4-dns"
+OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
+
+detect_outer_mtu() {
+  local target="$1"
+  local payload
+  for payload in 1372 1360 1320 1280 1240 1200 1160 1120 1080; do
+    if timeout 4 ping -4 -c 2 -W 1 -M do -s "$payload" "$target" 2>/dev/null | grep -q ' 0% packet loss'; then
+      echo $((payload + 28))
+      return
+    fi
+  done
+  echo 1200
+}
+
+auto_tune_mtu() {
+  local target="$1"
+  if [[ "$WG_MTU_REQUEST" != "auto" ]]; then
+    WG_MTU="$WG_MTU_REQUEST"
+  else
+    local outer_mtu
+    outer_mtu="$(detect_outer_mtu "$target")"
+    WG_MTU=$((outer_mtu - 80))
+    (( WG_MTU > 1280 )) && WG_MTU=1280
+    (( WG_MTU < 1080 )) && WG_MTU=1080
+  fi
+
+  if [[ "$TCP_MSS_REQUEST" != "auto" ]]; then
+    TCP_MSS="$TCP_MSS_REQUEST"
+  else
+    TCP_MSS=$((WG_MTU - 40))
+    (( TCP_MSS < 1040 )) && TCP_MSS=1040
+  fi
+}
 
 echo "==> 预清理旧 WireGuard 路由，避免安装阶段没网"
 systemctl stop wg-quick@wg0 >/dev/null 2>&1 || true
@@ -67,8 +102,10 @@ while ip -4 rule del table main suppress_prefixlength 0 priority 101 2>/dev/null
 while ip -4 rule del not fwmark "${WG_FWMARK}" table "${WG_TABLE}" priority 102 2>/dev/null; do :; done
 ip -4 route flush table "${WG_TABLE}" 2>/dev/null || true
 while iptables -t mangle -D OUTPUT -p tcp -m multiport --sports "${SSH_PORTS}" -j MARK --set-mark "${WG_FWMARK}" 2>/dev/null; do :; done
-while iptables -t mangle -D OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${TCP_MSS}" 2>/dev/null; do :; done
-while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${TCP_MSS}" 2>/dev/null; do :; done
+for old_mss in $OLD_MSS_VALUES; do
+  while iptables -t mangle -D OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+  while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
+done
 while iptables -t mangle -D OUTPUT -m mark --mark 0x0 -m connmark --mark "${WG_FWMARK}" -j CONNMARK --restore-mark 2>/dev/null; do :; done
 while iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null; do :; done
 while iptables -t mangle -D PREROUTING -i "${WAN_IF}" -m conntrack --ctstate NEW -j CONNMARK --set-mark "${WG_FWMARK}" 2>/dev/null; do :; done
@@ -126,6 +163,10 @@ else
 fi
 [[ -n "$HOME_ENDPOINT_IPV4" ]] || { echo "无法解析家宽 VPS 的 IPv4 A 记录"; exit 1; }
 echo "    家宽 Endpoint IPv4 = ${HOME_ENDPOINT_IPV4}:${HOME_PORT}"
+
+echo "==> 自动探测 WireGuard MTU/MSS"
+auto_tune_mtu "$HOME_ENDPOINT_IPV4"
+echo "    MTU = ${WG_MTU}, TCP MSS = ${TCP_MSS}"
 
 echo "==> 写入 DNS 切换助手"
 mkdir -p "$(dirname "$DNS_HELPER")"
