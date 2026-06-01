@@ -289,6 +289,8 @@ import urllib.parse
 
 path = os.environ["PROXY_LIST_FILE"]
 raw = os.environ["RAW_PROXY"].strip().replace("：", ":")
+if raw.startswith("ssocks5://"):
+    raw = "socks5://" + raw[len("ssocks5://"):]
 if "://" not in raw:
     raw = "socks5://" + raw
 url = urllib.parse.urlparse(raw)
@@ -751,6 +753,8 @@ import urllib.parse
 
 path = os.environ["PROXY_LIST_FILE"]
 raw = os.environ["RAW_PROXY"].strip().replace("：", ":")
+if raw.startswith("ssocks5://"):
+    raw = "socks5://" + raw[len("ssocks5://"):]
 if "://" not in raw:
     raw = "socks5://" + raw
 url = urllib.parse.urlparse(raw)
