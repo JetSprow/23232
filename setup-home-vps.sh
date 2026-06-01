@@ -4,6 +4,7 @@
 # 用法: sudo bash setup-home-vps.sh
 # 可选: WG_PORT=443 sudo bash setup-home-vps.sh
 set -euo pipefail
+trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
 
 [[ $EUID -eq 0 ]] || { echo "需要 root 权限 (sudo)"; exit 1; }
 command -v apt-get >/dev/null || { echo "仅支持 Debian/Ubuntu"; exit 1; }
@@ -40,22 +41,26 @@ detect_outer_mtu() {
 }
 
 auto_tune_mtu() {
-  if [[ "$WG_MTU_REQUEST" != "auto" ]]; then
+  set +e
+  if [[ "$WG_MTU_REQUEST" =~ ^[0-9]+$ ]]; then
     WG_MTU="$WG_MTU_REQUEST"
   else
     local outer_mtu
     outer_mtu="$(detect_outer_mtu)"
+    [[ "$outer_mtu" =~ ^[0-9]+$ ]] || outer_mtu=1200
     WG_MTU=$((outer_mtu - 80))
     (( WG_MTU > 1280 )) && WG_MTU=1280
     (( WG_MTU < 1080 )) && WG_MTU=1080
   fi
 
-  if [[ "$TCP_MSS_REQUEST" != "auto" ]]; then
+  if [[ "$TCP_MSS_REQUEST" =~ ^[0-9]+$ ]]; then
     TCP_MSS="$TCP_MSS_REQUEST"
   else
     TCP_MSS=$((WG_MTU - 40))
     (( TCP_MSS < 1040 )) && TCP_MSS=1040
   fi
+  set -e
+  return 0
 }
 
 if [[ -z "$WG_PORT" ]]; then
