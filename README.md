@@ -40,11 +40,11 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-normal-vp
 sudo bash setup-normal-vps.sh
 ```
 
-脚本默认使用保守的 WireGuard `MTU=1180` 和 TCP `MSS=1140`，避免部分家宽线路 TLS 卡住。如需手动指定：
+脚本默认使用更保守的 WireGuard `MTU=1060` 和 TCP `MSS=1020`，避免部分家宽线路 TLS/HTTP2 卡住。如需手动指定：
 
 ```bash
-sudo WG_MTU=1180 TCP_MSS=1140 bash setup-normal-vps.sh
-sudo WG_MTU=1180 TCP_MSS=1140 bash setup-home-vps.sh
+sudo WG_MTU=1060 TCP_MSS=1020 bash setup-normal-vps.sh
+sudo WG_MTU=1060 TCP_MSS=1020 bash setup-home-vps.sh
 ```
 
 如需启用自动探测：

@@ -13,12 +13,12 @@ WG_PORT="${WG_PORT:-}"
 WG_NET="10.0.0.0/24"
 WG_SERVER_IP="10.0.0.1"
 WG_CLIENT_IP="10.0.0.2"
-WG_MTU_REQUEST="${WG_MTU:-1180}"
-TCP_MSS_REQUEST="${TCP_MSS:-1140}"
-WG_MTU="1180"
-TCP_MSS="1140"
+WG_MTU_REQUEST="${WG_MTU:-1060}"
+TCP_MSS_REQUEST="${TCP_MSS:-1020}"
+WG_MTU="1060"
+TCP_MSS="1020"
 MTU_PROBE_TARGETS="${MTU_PROBE_TARGETS:-185.199.108.133 1.1.1.1 8.8.8.8}"
-OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040"
+OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040 1020 1000 984"
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 [[ -n "$WAN_IF" ]] || { echo "无法识别默认网卡"; exit 1; }
 
@@ -50,14 +50,14 @@ auto_tune_mtu() {
     [[ "$outer_mtu" =~ ^[0-9]+$ ]] || outer_mtu=1200
     WG_MTU=$((outer_mtu - 80))
     (( WG_MTU > 1280 )) && WG_MTU=1280
-    (( WG_MTU < 1080 )) && WG_MTU=1080
+    (( WG_MTU < 1020 )) && WG_MTU=1020
   fi
 
   if [[ "$TCP_MSS_REQUEST" =~ ^[0-9]+$ ]]; then
     TCP_MSS="$TCP_MSS_REQUEST"
   else
     TCP_MSS=$((WG_MTU - 40))
-    (( TCP_MSS < 1040 )) && TCP_MSS=1040
+    (( TCP_MSS < 980 )) && TCP_MSS=980
   fi
   set -e
   return 0
