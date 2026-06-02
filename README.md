@@ -81,6 +81,15 @@ sudo SS_HOST=你的入口IP或域名 SS_PORT=端口 bash setup-home-ss.sh
 普通机器接入该 SS：
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-egress-socks.sh -o setup-egress-socks.sh
+sudo BUILTIN_PROXY_URL='ss://aes-256-gcm:密码@地址:端口' bash setup-egress-socks.sh
+```
+
+已安装 `zck` 后切换到新的 SS：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-egress-socks.sh -o setup-egress-socks.sh
+sudo bash setup-egress-socks.sh
 sudo zck proxy add 'ss://aes-256-gcm:密码@地址:端口'
 sudo zck proxy switch
 sudo zck restart
@@ -96,6 +105,37 @@ sudo zck test
 ```
 
 `zck` 是普通机器客户端脚本安装的管理命令，家宽 SOCKS5 服务端不需要也不会安装该命令。SOCKS5 客户端默认使用普通机器本机 DNS 直连解析，避免 DNS 查询走家宽 SOCKS5 后被重置；实际业务流量仍会走家宽 SOCKS5 出口。
+
+## Shadowsocks 模式
+
+当 SOCKS5 服务端本机测试正常，但普通机器远程连接后 HTTPS/TLS 一直 `Connection reset by peer`，优先使用 Shadowsocks 模式。
+
+1. 家宽机器运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-ss.sh -o setup-home-ss.sh
+sudo SS_HOST=你的入口IP或域名 SS_PORT=端口 bash setup-home-ss.sh
+```
+
+2. 复制输出的 `ss://...`。
+
+3. 普通机器运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-egress-socks.sh -o setup-egress-socks.sh
+sudo BUILTIN_PROXY_URL='ss://aes-256-gcm:密码@地址:端口' bash setup-egress-socks.sh
+sudo zck test
+```
+
+4. 查看和切换上游：
+
+```bash
+sudo zck proxy list
+sudo zck proxy add 'ss://aes-256-gcm:密码@地址:端口'
+sudo zck proxy switch
+sudo zck restart
+sudo zck test
+```
 
 ## GRE 优化线路模式
 
