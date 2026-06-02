@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# 优化线路 GRE 网关脚本
+# 运行位置: 优化线路机器
+# 作用: 建立 GRE 到普通 Incus 节点，负责小鸡出口 SNAT 和公网端口 DNAT。
+# 用法:
+#   sudo bash setup-gre-gateway.sh
+#   sudo BACKEND_PUBLIC_IP=1.2.3.4 GUEST_SUBNET=10.10.0.0/22 bash setup-gre-gateway.sh
+set -euo pipefail
+trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
+
+[[ $EUID -eq 0 ]] || { echo "需要 root 权限 (sudo)"; exit 1; }
+command -v apt-get >/dev/null || { echo "仅支持 Debian/Ubuntu"; exit 1; }
+
+STATE_DIR="/etc/gre-gateway"
+CONFIG_FILE="$STATE_DIR/config.env"
+APPLY_BIN="/usr/local/sbin/gre-gateway-apply"
+HELPER_BIN="/usr/local/bin/gre-gw"
+UNIT_FILE="/etc/systemd/system/gre-gateway.service"
+
+GRE_NAME="${GRE_NAME:-gre-incus}"
+GRE_TABLE="${GRE_TABLE:-}"
+GATEWAY_TUN_IP="${GATEWAY_TUN_IP:-10.255.0.1}"
+BACKEND_TUN_IP="${BACKEND_TUN_IP:-10.255.0.2}"
+GRE_MTU="${GRE_MTU:-1476}"
+TCP_MSS="${TCP_MSS:-1436}"
+GUEST_SUBNET="${GUEST_SUBNET:-10.10.0.0/22}"
+BACKEND_PUBLIC_IP="${BACKEND_PUBLIC_IP:-}"
+GATEWAY_PUBLIC_IP="${GATEWAY_PUBLIC_IP:-}"
+WAN_IF="${WAN_IF:-}"
+
+valid_ip_or_host() {
+  [[ -n "$1" && "$1" != *:* ]]
+}
+
+if [[ -z "$BACKEND_PUBLIC_IP" ]]; then
+  read -rp "普通 Incus 节点公网 IPv4/域名: " BACKEND_PUBLIC_IP
+fi
+valid_ip_or_host "$BACKEND_PUBLIC_IP" || { echo "普通节点地址无效，只支持 IPv4 或 A 记录域名"; exit 1; }
+
+echo "==> 安装依赖"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq iproute2 iptables curl ca-certificates
+
+WAN_IF="${WAN_IF:-$(ip -4 route show default | awk '/default/ {print $5; exit}')}"
+[[ -n "$WAN_IF" ]] || { echo "无法识别默认出口网卡"; exit 1; }
+
+if [[ -z "$GATEWAY_PUBLIC_IP" ]]; then
+  GATEWAY_PUBLIC_IP="$(ip -4 -o addr show dev "$WAN_IF" scope global | awk '{split($4,a,"/"); print a[1]; exit}')"
+fi
+[[ -n "$GATEWAY_PUBLIC_IP" ]] || { echo "无法识别优化节点本机 IPv4"; exit 1; }
+
+BACKEND_RESOLVED_IP="$BACKEND_PUBLIC_IP"
+if [[ ! "$BACKEND_PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  BACKEND_RESOLVED_IP="$(getent ahostsv4 "$BACKEND_PUBLIC_IP" | awk '{print $1; exit}')"
+fi
+[[ -n "$BACKEND_RESOLVED_IP" ]] || { echo "无法解析普通节点 IPv4: $BACKEND_PUBLIC_IP"; exit 1; }
+
+echo "==> 写入配置"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+GRE_NAME=${GRE_NAME}
+WAN_IF=${WAN_IF}
+GATEWAY_PUBLIC_IP=${GATEWAY_PUBLIC_IP}
+BACKEND_PUBLIC_IP=${BACKEND_RESOLVED_IP}
+GATEWAY_TUN_IP=${GATEWAY_TUN_IP}
+BACKEND_TUN_IP=${BACKEND_TUN_IP}
+GRE_MTU=${GRE_MTU}
+TCP_MSS=${TCP_MSS}
+GUEST_SUBNET=${GUEST_SUBNET}
+EOF
+chmod 600 "$CONFIG_FILE"
+
+cat > "$APPLY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-gateway/config.env
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+cat > /etc/sysctl.d/99-gre-gateway.conf <<SYSCTL
+net.ipv4.ip_forward=1
+SYSCTL
+
+ip tunnel del "$GRE_NAME" 2>/dev/null || true
+ip tunnel add "$GRE_NAME" mode gre local "$GATEWAY_PUBLIC_IP" remote "$BACKEND_PUBLIC_IP" ttl 255
+ip addr add "${GATEWAY_TUN_IP}/30" dev "$GRE_NAME"
+ip link set "$GRE_NAME" mtu "$GRE_MTU" up
+ip route replace "$GUEST_SUBNET" via "$BACKEND_TUN_IP" dev "$GRE_NAME"
+
+iptables -C INPUT -p 47 -s "$BACKEND_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -I INPUT -p 47 -s "$BACKEND_PUBLIC_IP" -j ACCEPT
+iptables -C FORWARD -i "$GRE_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$GRE_NAME" -o "$WAN_IF" -j ACCEPT
+iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WAN_IF" -o "$GRE_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || iptables -t nat -A POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP"
+iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+EOF
+chmod +x "$APPLY_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-gateway/config.env
+
+usage() {
+  cat <<USAGE
+用法:
+  sudo gre-gw status
+  sudo gre-gw add tcp|udp 外部端口 小鸡IP 内部端口
+  sudo gre-gw del tcp|udp 外部端口 小鸡IP 内部端口
+  sudo gre-gw list
+USAGE
+}
+
+status() {
+  ip -brief addr show "$GRE_NAME" 2>/dev/null || true
+  ip route show "$GUEST_SUBNET" 2>/dev/null || true
+  iptables -t nat -S | grep -E "GRE-GW|${GUEST_SUBNET}|${GRE_NAME}|DNAT" || true
+}
+
+add_forward() {
+  local proto="$1" ext="$2" guest="$3" inner="$4"
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] || { echo "协议只能是 tcp 或 udp"; exit 1; }
+  iptables -t nat -C PREROUTING -i "$WAN_IF" -p "$proto" --dport "$ext" -j DNAT --to-destination "${guest}:${inner}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$WAN_IF" -p "$proto" --dport "$ext" -m comment --comment "GRE-GW ${proto}:${ext}->${guest}:${inner}" -j DNAT --to-destination "${guest}:${inner}"
+  iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$guest" --dport "$inner" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$guest" --dport "$inner" -m comment --comment "GRE-GW ${proto}:${ext}->${guest}:${inner}" -j ACCEPT
+  echo "已添加: ${proto} ${GATEWAY_PUBLIC_IP}:${ext} -> ${guest}:${inner}"
+}
+
+del_forward() {
+  local proto="$1" ext="$2" guest="$3" inner="$4"
+  while iptables -t nat -D PREROUTING -i "$WAN_IF" -p "$proto" --dport "$ext" -j DNAT --to-destination "${guest}:${inner}" 2>/dev/null; do :; done
+  while iptables -D FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$guest" --dport "$inner" -j ACCEPT 2>/dev/null; do :; done
+  echo "已删除: ${proto} ${GATEWAY_PUBLIC_IP}:${ext} -> ${guest}:${inner}"
+}
+
+case "${1:-}" in
+  status) status ;;
+  list) iptables -t nat -S PREROUTING | grep 'GRE-GW' || true ;;
+  add) shift; [[ $# -eq 4 ]] || { usage; exit 1; }; add_forward "$@" ;;
+  del|delete|rm) shift; [[ $# -eq 4 ]] || { usage; exit 1; }; del_forward "$@" ;;
+  *) usage; exit 1 ;;
+esac
+EOF
+chmod +x "$HELPER_BIN"
+
+cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=GRE optimized gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${APPLY_BIN}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "==> 启动 GRE 网关"
+systemctl daemon-reload
+systemctl enable --now gre-gateway.service
+
+echo
+echo "============================================================"
+echo " GRE 优化线路网关配置完成"
+echo "------------------------------------------------------------"
+echo " 优化节点公网: ${GATEWAY_PUBLIC_IP}"
+echo " 普通节点公网: ${BACKEND_RESOLVED_IP}"
+echo " GRE:          ${GATEWAY_TUN_IP}/30 -> ${BACKEND_TUN_IP}/30"
+echo " 小鸡网段:     ${GUEST_SUBNET}"
+echo " MTU/MSS:      MTU ${GRE_MTU}, TCP MSS ${TCP_MSS}"
+echo "------------------------------------------------------------"
+echo " 添加端口转发示例:"
+echo "   sudo gre-gw add tcp 25022 10.10.0.123 22"
+echo " 状态检查:"
+echo "   sudo gre-gw status"
+echo "============================================================"
