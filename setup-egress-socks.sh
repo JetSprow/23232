@@ -340,7 +340,7 @@ user = urllib.parse.quote(os.environ["ACTIVE_PROXY_USER"], safe="")
 password = urllib.parse.quote(os.environ["ACTIVE_PROXY_PASS"], safe="")
 host = os.environ["ACTIVE_PROXY_HOST"]
 port = os.environ["ACTIVE_PROXY_PORT"]
-print(f"socks5h://{user}:{password}@{host}:{port}")
+print(f"socks5://{user}:{password}@{host}:{port}")
 PY
 }
 
@@ -446,17 +446,8 @@ cfg = {
                 "server": bootstrap_dns,
                 "detour": "direct",
             },
-            # Proxied resolver: DNS-over-HTTPS to 1.1.1.1 through SOCKS5.
-            {
-                "type": "https",
-                "tag": "proxy-dns",
-                "server": "1.1.1.1",
-                "server_port": 443,
-                "path": "/dns-query",
-                "detour": "proxy",
-            },
         ],
-        "final": "proxy-dns",
+        "final": "local-dns",
         "strategy": "ipv4_only",
     },
     "inbounds": [
