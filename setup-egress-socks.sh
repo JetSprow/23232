@@ -345,15 +345,20 @@ PY
 }
 
 test_active_proxy_direct() {
-  local proxy_url out
+  local proxy_url out url
   proxy_url="$(active_proxy_url)"
-  out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" https://ifconfig.me 2>/dev/null || true)"
+  for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" "$url" 2>/dev/null || true)"
+    [[ -n "$out" ]] && break
+  done
   if [[ -z "$out" ]]; then
-    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" https://ip.sb 2>/dev/null || true)"
-  fi
-  if [[ -z "$out" ]]; then
-    echo "上游 SOCKS5 真实连通性测试失败，请确认地址、端口、账号密码和家宽防火墙。" >&2
-    return 1
+    echo "  [WARN] 上游 SOCKS5 出口 IP 测试失败，可能是测速站被重置/拦截。" >&2
+    echo "         将继续生成配置；如需测试失败就退出，请加 STRICT_PROXY_TEST=1。" >&2
+    if [[ "${STRICT_PROXY_TEST:-0}" == "1" ]]; then
+      echo "上游 SOCKS5 真实连通性测试失败，请确认地址、端口、账号密码和家宽防火墙。" >&2
+      return 1
+    fi
+    return 0
   fi
   echo "  上游 SOCKS5 测试通过，代理出口 IP: $out"
 }
