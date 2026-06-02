@@ -82,6 +82,12 @@ sudo zck test
 
 适合“用户 -> 优化线路节点 -> 普通 Incus 节点小鸡”的模式。小鸡仍创建在普通节点，公网入口和出口都走优化节点。
 
+小鸡网段是普通 Incus 节点现有 `incusbr0` 的 IPv4 网段，不是脚本额外创建的新网段。可在普通节点执行：
+
+```bash
+ip -4 addr show incusbr0
+```
+
 1. 在优化线路节点运行：
 
 ```bash
@@ -100,6 +106,26 @@ sudo GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup
 
 ```bash
 sudo gre-gw add tcp 25022 小鸡IP 22
+```
+
+4. 两端一键切换：
+
+优化线路节点：
+
+```bash
+sudo gre-gw status
+sudo gre-gw off
+sudo gre-gw on
+sudo gre-gw restart
+```
+
+普通 Incus 节点：
+
+```bash
+sudo gre-be status
+sudo gre-be off
+sudo gre-be on
+sudo gre-be restart
 ```
 
 注意：每个普通节点的小鸡网段必须唯一，例如 `10.10.0.0/22`、`10.14.0.0/22`、`10.18.0.0/22`，否则优化节点无法正确路由。

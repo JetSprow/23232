@@ -14,6 +14,8 @@ command -v apt-get >/dev/null || { echo "仅支持 Debian/Ubuntu"; exit 1; }
 STATE_DIR="/etc/gre-backend"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/gre-backend-apply"
+REMOVE_BIN="/usr/local/sbin/gre-backend-remove"
+HELPER_BIN="/usr/local/bin/gre-be"
 UNIT_FILE="/etc/systemd/system/gre-backend.service"
 
 GRE_NAME="${GRE_NAME:-gre-opt}"
@@ -23,15 +25,29 @@ GATEWAY_TUN_IP="${GATEWAY_TUN_IP:-10.255.0.1}"
 BACKEND_TUN_IP="${BACKEND_TUN_IP:-10.255.0.2}"
 GRE_MTU="${GRE_MTU:-1476}"
 TCP_MSS="${TCP_MSS:-1436}"
-GUEST_SUBNET="${GUEST_SUBNET:-10.10.0.0/22}"
-INCUS_BRIDGE="${INCUS_BRIDGE:-incusbr0}"
+GUEST_SUBNET="${GUEST_SUBNET:-}"
+INCUS_BRIDGE="${INCUS_BRIDGE:-}"
 GATEWAY_PUBLIC_IP="${GATEWAY_PUBLIC_IP:-}"
 BACKEND_PUBLIC_IP="${BACKEND_PUBLIC_IP:-}"
 
 if [[ -z "$GATEWAY_PUBLIC_IP" ]]; then
+  echo "优化线路节点地址说明: 填用户入口所在优化线路机器的公网 IPv4 或 A 记录域名。"
   read -rp "优化线路节点公网 IPv4/域名: " GATEWAY_PUBLIC_IP
 fi
 [[ -n "$GATEWAY_PUBLIC_IP" && "$GATEWAY_PUBLIC_IP" != *:* ]] || { echo "优化节点地址无效，只支持 IPv4 或 A 记录域名"; exit 1; }
+
+if [[ -z "$INCUS_BRIDGE" ]]; then
+  echo "Incus bridge 说明: 通常是 incusbr0。小鸡网段来自这个网桥，不会额外创建新网段。"
+  read -rp "Incus bridge 名称 [incusbr0]: " INCUS_BRIDGE
+  INCUS_BRIDGE="${INCUS_BRIDGE:-incusbr0}"
+fi
+
+if [[ -z "$GUEST_SUBNET" ]]; then
+  echo "小鸡网段说明: 填 ${INCUS_BRIDGE} 的 IPv4 CIDR，例如 10.10.0.0/22。"
+  echo "查看命令: ip -4 addr show ${INCUS_BRIDGE}"
+  read -rp "小鸡/Incus bridge 网段 [10.10.0.0/22]: " GUEST_SUBNET
+  GUEST_SUBNET="${GUEST_SUBNET:-10.10.0.0/22}"
+fi
 
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
@@ -101,6 +117,63 @@ iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j T
 EOF
 chmod +x "$APPLY_BIN"
 
+cat > "$REMOVE_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-backend/config.env
+
+while iptables -t mangle -D FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
+while iptables -t mangle -D FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null; do :; done
+while iptables -D FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+while iptables -D FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null; do :; done
+while iptables -D INPUT -p 47 -s "$GATEWAY_PUBLIC_IP" -j ACCEPT 2>/dev/null; do :; done
+
+ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev/null || true
+ip route flush table "$GRE_TABLE" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+ip tunnel del "$GRE_NAME" 2>/dev/null || true
+EOF
+chmod +x "$REMOVE_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-backend/config.env
+
+usage() {
+  cat <<USAGE
+用法:
+  sudo gre-be on
+  sudo gre-be off
+  sudo gre-be restart
+  sudo gre-be status
+
+说明:
+  这个命令运行在普通 Incus 节点，只控制小鸡走优化线路网关的 GRE 隧道。
+  off 会关闭 GRE、删除小鸡源地址策略路由和核心防火墙规则，宿主机默认出口保持原线路。
+USAGE
+}
+
+status() {
+  systemctl is-active gre-backend.service 2>/dev/null || true
+  ip -brief addr show "$GRE_NAME" 2>/dev/null || true
+  ip rule show | grep -F "lookup ${GRE_TABLE}" || true
+  ip route show table "$GRE_TABLE" 2>/dev/null || true
+  iptables -S | grep -E "${GRE_NAME}|${INCUS_BRIDGE}|${GATEWAY_PUBLIC_IP}" || true
+  iptables -t nat -S POSTROUTING | grep -E "${GRE_NAME}|${GUEST_SUBNET}" || true
+}
+
+case "${1:-}" in
+  on|enable|start) systemctl enable --now gre-backend.service ;;
+  off|disable|stop) systemctl disable --now gre-backend.service ;;
+  restart) systemctl restart gre-backend.service ;;
+  status) status ;;
+  *) usage; exit 1 ;;
+esac
+EOF
+chmod +x "$HELPER_BIN"
+
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=GRE backend for optimized gateway
@@ -111,6 +184,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=${APPLY_BIN}
+ExecStop=${REMOVE_BIN}
 
 [Install]
 WantedBy=multi-user.target
@@ -131,7 +205,12 @@ echo " 小鸡网段:     ${GUEST_SUBNET}"
 echo " Incus Bridge: ${INCUS_BRIDGE}"
 echo " MTU/MSS:      MTU ${GRE_MTU}, TCP MSS ${TCP_MSS}"
 echo "------------------------------------------------------------"
+echo " 一键开关:"
+echo "   sudo gre-be on"
+echo "   sudo gre-be off"
+echo "   sudo gre-be restart"
 echo " 检查:"
+echo "   sudo gre-be status"
 echo "   ip addr show ${GRE_NAME}"
 echo "   ip rule show | grep ${GRE_TABLE}"
 echo "   ping -c 3 ${GATEWAY_TUN_IP}"
