@@ -419,15 +419,15 @@ except Exception:
 if idx < 0 or idx >= len(items):
     idx = 0
 item = items[idx]
-	for key, value in {
-	    "ACTIVE_PROXY_INDEX": str(idx),
-	    "ACTIVE_PROXY_TYPE": str(item.get("type", "socks5")),
-	    "ACTIVE_PROXY_HOST": str(item["host"]),
-	    "ACTIVE_PROXY_PORT": str(item["port"]),
-	    "ACTIVE_PROXY_USER": str(item.get("username", "")),
-	    "ACTIVE_PROXY_PASS": str(item.get("password", "")),
-	    "ACTIVE_PROXY_METHOD": str(item.get("method", "")),
-	}.items():
+for key, value in {
+    "ACTIVE_PROXY_INDEX": str(idx),
+    "ACTIVE_PROXY_TYPE": str(item.get("type", "socks5")),
+    "ACTIVE_PROXY_HOST": str(item["host"]),
+    "ACTIVE_PROXY_PORT": str(item["port"]),
+    "ACTIVE_PROXY_USER": str(item.get("username", "")),
+    "ACTIVE_PROXY_PASS": str(item.get("password", "")),
+    "ACTIVE_PROXY_METHOD": str(item.get("method", "")),
+}.items():
     print(f"{key}={shlex.quote(value)}")
 PY
   )"
