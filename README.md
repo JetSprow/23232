@@ -5,7 +5,8 @@
 - `setup-home-vps.sh`：家宽 VPS 出口端，配置 WireGuard 服务端、NAT、DNS 与基础过滤规则。
 - `setup-normal-vps.sh`：普通 VPS 客户端，将 IPv4 出口切到家宽 VPS，并保留 SSH 连接。
 - `setup-home-socks5.sh`：家宽 VPS SOCKS5 服务端，创建账号密码并输出可复制的 SOCKS5 地址。
-- `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5。
+- `setup-home-ss.sh`：家宽 VPS Shadowsocks 服务端，适合 SOCKS5 被线路 reset 时使用。
+- `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5 或 Shadowsocks。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
 - `diagnose-github-raw.sh`：诊断 `raw.githubusercontent.com`、`Check.Place` 等 HTTPS 连接卡住的问题。
@@ -70,7 +71,23 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-egress-so
 sudo BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' bash setup-egress-socks.sh
 ```
 
-已安装后切换 SOCKS5：
+如果 SOCKS5 远程 TLS 握手被 reset，改用 Shadowsocks：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-ss.sh -o setup-home-ss.sh
+sudo SS_HOST=你的入口IP或域名 SS_PORT=端口 bash setup-home-ss.sh
+```
+
+普通机器接入该 SS：
+
+```bash
+sudo zck proxy add 'ss://aes-256-gcm:密码@地址:端口'
+sudo zck proxy switch
+sudo zck restart
+sudo zck test
+```
+
+已安装后切换上游出口：
 
 ```bash
 sudo zck proxy add 'socks5://用户名:密码@地址:端口'

@@ -45,6 +45,7 @@ set -euo pipefail
 # Upstream SOCKS5 endpoint.
 # Prefer passing a full URL, or enter it interactively on first install:
 #   sudo BUILTIN_PROXY_URL='socks5://user:pass@1.2.3.4:6013' bash setup-egress-socks.sh
+#   sudo BUILTIN_PROXY_URL='ss://aes-256-gcm:pass@1.2.3.4:6013' bash setup-egress-socks.sh
 # Legacy split env vars are still supported:
 #   sudo BUILTIN_PROXY_HOST=1.2.3.4 BUILTIN_PROXY_PORT=6013 ... bash setup-egress-socks.sh
 # -----------------------------------------------------------------------------
@@ -278,17 +279,18 @@ ensure_proxy_store() {
   if [[ -n "$raw" || ! -s "$PROXY_LIST_FILE" ]]; then
     if [[ -z "$raw" ]]; then
       if [[ ! -t 0 ]]; then
-        echo "未配置上游 SOCKS5。请用 BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' 运行，或交互式执行脚本。" >&2
+        echo "未配置上游代理。请用 BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' 或 'ss://加密:密码@地址:端口' 运行，或交互式执行脚本。" >&2
         exit 1
       fi
-      echo "未检测到上游 SOCKS5，首次安装需要输入家宽端输出的地址。"
-      read -r -p "请输入 SOCKS5 (socks5://用户名:密码@地址:端口): " raw
+      echo "未检测到上游代理，首次安装需要输入家宽端输出的地址。"
+      read -r -p "请输入代理地址 (socks5://用户名:密码@地址:端口 或 ss://加密:密码@地址:端口): " raw
     fi
     PROXY_LIST_FILE="$PROXY_LIST_FILE" \
     RAW_PROXY="$raw" \
     python3 - <<'PY'
 import json
 import os
+import base64
 import urllib.parse
 
 path = os.environ["PROXY_LIST_FILE"]
@@ -298,18 +300,34 @@ if raw.startswith("ssocks5://"):
 if "://" not in raw:
     raw = "socks5://" + raw
 url = urllib.parse.urlparse(raw)
-if url.scheme != "socks5":
-    raise SystemExit("只支持 socks5:// 或 用户名:密码@地址:端口")
+if url.scheme not in ("socks5", "ss"):
+    raise SystemExit("只支持 socks5:// 或 ss://")
 if not url.hostname or not url.port:
-    raise SystemExit("格式错误，应为 socks5://用户名:密码@地址:端口")
-if not url.username or url.password is None:
-    raise SystemExit("格式错误，必须包含用户名和密码")
+    raise SystemExit("格式错误，应为 socks5://用户名:密码@地址:端口 或 ss://加密:密码@地址:端口")
+if url.scheme == "socks5" and (not url.username or url.password is None):
+    raise SystemExit("SOCKS5 格式错误，必须包含用户名和密码")
+if url.scheme == "ss":
+    method = urllib.parse.unquote(url.username or "")
+    password = urllib.parse.unquote(url.password or "")
+    if not method or not password:
+        userinfo = urllib.parse.unquote((url.netloc.rsplit("@", 1)[0] if "@" in url.netloc else ""))
+        padded = userinfo + "=" * (-len(userinfo) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(padded.encode()).decode()
+        except Exception:
+            decoded = ""
+        if ":" in decoded:
+            method, password = decoded.split(":", 1)
+    if not method or not password:
+        raise SystemExit("SS 格式错误，应为 ss://加密:密码@地址:端口")
 item = {
     "name": "builtin",
+    "type": "shadowsocks" if url.scheme == "ss" else "socks5",
     "host": url.hostname,
     "port": int(url.port),
-    "username": urllib.parse.unquote(url.username),
-    "password": urllib.parse.unquote(url.password or ""),
+    "username": urllib.parse.unquote(url.username or "") if url.scheme == "socks5" else "",
+    "password": urllib.parse.unquote(url.password or "") if url.scheme == "socks5" else password,
+    "method": method if url.scheme == "ss" else "",
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump([item], f, ensure_ascii=False, indent=2)
@@ -328,6 +346,9 @@ PY
 
 active_proxy_url() {
   load_active_proxy
+  if [[ "${ACTIVE_PROXY_TYPE:-socks5}" != "socks5" ]]; then
+    return 1
+  fi
   ACTIVE_PROXY_HOST="$ACTIVE_PROXY_HOST" \
   ACTIVE_PROXY_PORT="$ACTIVE_PROXY_PORT" \
   ACTIVE_PROXY_USER="$ACTIVE_PROXY_USER" \
@@ -346,6 +367,10 @@ PY
 
 test_active_proxy_direct() {
   local proxy_url out url
+  if [[ "${ACTIVE_PROXY_TYPE:-socks5}" != "socks5" ]]; then
+    echo "  上游 SS 将由 sing-box 校验并连接，跳过 curl SOCKS5 测试。"
+    return 0
+  fi
   proxy_url="$(active_proxy_url)"
   for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
     out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" "$url" 2>/dev/null || true)"
@@ -363,6 +388,18 @@ test_active_proxy_direct() {
   echo "  上游 SOCKS5 测试通过，代理出口 IP: $out"
 }
 
+curl_egress_ip() {
+  local out url
+  for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+      echo "$out"
+      return 0
+    fi
+  done
+  return 1
+}
+
 load_active_proxy() {
   ensure_proxy_store
   eval "$(
@@ -374,7 +411,7 @@ import shlex
 with open(os.environ["PROXY_LIST_FILE"], "r", encoding="utf-8") as f:
     items = json.load(f)
 if not isinstance(items, list) or not items:
-    raise SystemExit("SOCKS5 出口列表为空")
+    raise SystemExit("上游出口列表为空")
 try:
     idx = int(open(os.environ["ACTIVE_PROXY_FILE"], "r", encoding="utf-8").read().strip() or "0")
 except Exception:
@@ -382,13 +419,15 @@ except Exception:
 if idx < 0 or idx >= len(items):
     idx = 0
 item = items[idx]
-for key, value in {
-    "ACTIVE_PROXY_INDEX": str(idx),
-    "ACTIVE_PROXY_HOST": str(item["host"]),
-    "ACTIVE_PROXY_PORT": str(item["port"]),
-    "ACTIVE_PROXY_USER": str(item.get("username", "")),
-    "ACTIVE_PROXY_PASS": str(item.get("password", "")),
-}.items():
+	for key, value in {
+	    "ACTIVE_PROXY_INDEX": str(idx),
+	    "ACTIVE_PROXY_TYPE": str(item.get("type", "socks5")),
+	    "ACTIVE_PROXY_HOST": str(item["host"]),
+	    "ACTIVE_PROXY_PORT": str(item["port"]),
+	    "ACTIVE_PROXY_USER": str(item.get("username", "")),
+	    "ACTIVE_PROXY_PASS": str(item.get("password", "")),
+	    "ACTIVE_PROXY_METHOD": str(item.get("method", "")),
+	}.items():
     print(f"{key}={shlex.quote(value)}")
 PY
   )"
@@ -404,23 +443,27 @@ write_singbox_config() {
   local proxy_ip
   proxy_ip="$(resolve_ipv4 "$ACTIVE_PROXY_HOST")"
   if [[ -z "$proxy_ip" ]]; then
-    echo "无法解析 SOCKS5 服务器 IPv4：$ACTIVE_PROXY_HOST" >&2
+    echo "无法解析上游服务器 IPv4：$ACTIVE_PROXY_HOST" >&2
     exit 1
   fi
 
-  echo "  上游 SOCKS5 #$((ACTIVE_PROXY_INDEX + 1)): ${ACTIVE_PROXY_USER:+$ACTIVE_PROXY_USER@}$proxy_ip:$ACTIVE_PROXY_PORT"
+  if [[ "${ACTIVE_PROXY_TYPE:-socks5}" == "shadowsocks" ]]; then
+    echo "  上游 SS #$((ACTIVE_PROXY_INDEX + 1)): ${ACTIVE_PROXY_METHOD}@${proxy_ip}:$ACTIVE_PROXY_PORT"
+  else
+    echo "  上游 SOCKS5 #$((ACTIVE_PROXY_INDEX + 1)): ${ACTIVE_PROXY_USER:+$ACTIVE_PROXY_USER@}$proxy_ip:$ACTIVE_PROXY_PORT"
+  fi
   test_active_proxy_direct
 
   python3 - \
     "$CONFIG_FILE" "$proxy_ip" "$ACTIVE_PROXY_PORT" \
-    "$ACTIVE_PROXY_USER" "$ACTIVE_PROXY_PASS" \
+    "$ACTIVE_PROXY_USER" "$ACTIVE_PROXY_PASS" "$ACTIVE_PROXY_TYPE" "$ACTIVE_PROXY_METHOD" \
     "$TUN_NAME" "$TUN_ADDR4" "$TUN_ADDR6" "$INCUS_SUBNET" \
     "$SINGBOX_TABLE_INDEX" "$SINGBOX_RULE_INDEX" "$BOOTSTRAP_DNS" "$TUN_IPV6" \
 <<'PY'
 import json
 import sys
 
-(_, cfg_path, proxy_ip, proxy_port, proxy_user, proxy_pass,
+(_, cfg_path, proxy_ip, proxy_port, proxy_user, proxy_pass, proxy_type, proxy_method,
  tun_name, tun_addr4, tun_addr6, incus_subnet, table_idx, rule_idx,
  bootstrap_dns, tun_ipv6) = sys.argv
 
@@ -437,6 +480,26 @@ excluded_cidrs = [
 ]
 if enable_ipv6:
     excluded_cidrs.extend(["::1/128", "fe80::/10", "ff00::/8"])
+
+if proxy_type == "shadowsocks":
+    proxy_outbound = {
+        "type": "shadowsocks",
+        "tag": "proxy",
+        "server": proxy_ip,
+        "server_port": int(proxy_port),
+        "method": proxy_method,
+        "password": proxy_pass,
+    }
+else:
+    proxy_outbound = {
+        "type": "socks",
+        "tag": "proxy",
+        "server": proxy_ip,
+        "server_port": int(proxy_port),
+        "version": "5",
+        "username": proxy_user,
+        "password": proxy_pass,
+    }
 
 cfg = {
     "log": {"level": "info", "timestamp": True},
@@ -474,15 +537,7 @@ cfg = {
         }
     ],
     "outbounds": [
-        {
-            "type": "socks",
-            "tag": "proxy",
-            "server": proxy_ip,
-            "server_port": int(proxy_port),
-            "version": "5",
-            "username": proxy_user,
-            "password": proxy_pass,
-        },
+        proxy_outbound,
         # `direct` must carry at least one explicit option so sing-box 1.13
         # accepts `detour: "direct"` on local-dns above.
         {
@@ -692,9 +747,9 @@ usage() {
   cat <<USAGE
 用法: sudo zck <command>
   status    sing-box / egress-bypass / TUN 状态
-  test      节点 + 第一个 Incus 小鸡 的 SOCKS5 出口测试
-  diag      详细诊断（路由、规则、nft、SOCKS 连通性）
-  proxy     管理 SOCKS5 出口：list | add 用户名:密码@ip:端口 | switch | delete
+  test      节点 + 第一个 Incus 小鸡 的代理出口测试
+  diag      详细诊断（路由、规则、nft、上游 TCP 连通性）
+  proxy     管理上游出口：list | add socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口 | switch | delete
   logs      tail sing-box journal
   check     校验 sing-box 配置
   restart   重启 sing-box（保留 bypass）
@@ -730,7 +785,7 @@ import os
 with open(os.environ["PROXY_LIST_FILE"], "r", encoding="utf-8") as f:
     items = json.load(f)
 if not items:
-    print("SOCKS5 出口列表为空，请先执行: sudo zck proxy add socks5://用户名:密码@地址:端口")
+    print("上游出口列表为空，请先执行: sudo zck proxy add socks5://用户名:密码@地址:端口 或 ss://加密:密码@地址:端口")
     raise SystemExit(0)
 try:
     active = int(open(os.environ["ACTIVE_PROXY_FILE"], "r", encoding="utf-8").read().strip() or "0")
@@ -738,10 +793,11 @@ except Exception:
     active = 0
 for i, item in enumerate(items, 1):
     mark = "*" if i - 1 == active else " "
-    user = item.get("username") or ""
+    typ = item.get("type", "socks5")
+    user = item.get("username") or item.get("method") or ""
     auth = f"{user}@" if user else ""
     name = item.get("name") or f"proxy-{i}"
-    print(f"{mark} {i}. {name}  {auth}{item['host']}:{item['port']}")
+    print(f"{mark} {i}. [{typ}] {name}  {auth}{item['host']}:{item['port']}")
 PY
 }
 
@@ -749,9 +805,10 @@ proxy_add() {
   ensure_proxy_store
   local raw="${1:-}"
   if [[ -z "$raw" ]]; then
-    read -r -p "请输入 SOCKS5（用户名:密码@ip:端口）: " raw
+    read -r -p "请输入代理（socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口）: " raw
   fi
   PROXY_LIST_FILE="$PROXY_LIST_FILE" RAW_PROXY="$raw" python3 - <<'PY'
+import base64
 import json
 import os
 import socket
@@ -764,12 +821,32 @@ if raw.startswith("ssocks5://"):
 if "://" not in raw:
     raw = "socks5://" + raw
 url = urllib.parse.urlparse(raw)
-if url.scheme != "socks5":
-    raise SystemExit("只支持 socks5:// 或 用户名:密码@ip:端口")
+if url.scheme not in ("socks5", "ss"):
+    raise SystemExit("只支持 socks5:// 或 ss://")
 if not url.hostname or not url.port:
-    raise SystemExit("格式错误，应为 用户名:密码@ip:端口")
-if not url.username or url.password is None:
-    raise SystemExit("格式错误，必须包含 用户名:密码")
+    raise SystemExit("格式错误，应为 socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口")
+method = ""
+password = ""
+username = ""
+if url.scheme == "socks5":
+    if not url.username or url.password is None:
+        raise SystemExit("SOCKS5 格式错误，必须包含 用户名:密码")
+    username = urllib.parse.unquote(url.username)
+    password = urllib.parse.unquote(url.password or "")
+else:
+    method = urllib.parse.unquote(url.username or "")
+    password = urllib.parse.unquote(url.password or "")
+    if not method or not password:
+        userinfo = urllib.parse.unquote((url.netloc.rsplit("@", 1)[0] if "@" in url.netloc else ""))
+        padded = userinfo + "=" * (-len(userinfo) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(padded.encode()).decode()
+        except Exception:
+            decoded = ""
+        if ":" in decoded:
+            method, password = decoded.split(":", 1)
+    if not method or not password:
+        raise SystemExit("SS 格式错误，应为 ss://加密:密码@ip:端口")
 try:
     socket.getaddrinfo(url.hostname, url.port, socket.AF_INET, socket.SOCK_STREAM)
 except socket.gaierror as exc:
@@ -778,20 +855,22 @@ try:
     with socket.create_connection((url.hostname, url.port), timeout=5):
         pass
 except OSError as exc:
-    raise SystemExit(f"SOCKS5 TCP 端口不可达：{url.hostname}:{url.port} ({exc})") from exc
+    raise SystemExit(f"上游 TCP 端口不可达：{url.hostname}:{url.port} ({exc})") from exc
 
 item = {
     "name": f"{url.hostname}:{url.port}",
+    "type": "shadowsocks" if url.scheme == "ss" else "socks5",
     "host": url.hostname,
     "port": int(url.port),
-    "username": urllib.parse.unquote(url.username),
-    "password": urllib.parse.unquote(url.password or ""),
+    "username": username,
+    "password": password,
+    "method": method,
 }
 with open(path, "r", encoding="utf-8") as f:
     items = json.load(f)
 for old in items:
-    if (old.get("host"), int(old.get("port", 0)), old.get("username", ""), old.get("password", "")) == (
-        item["host"], item["port"], item["username"], item["password"]
+    if (old.get("type", "socks5"), old.get("host"), int(old.get("port", 0)), old.get("username", ""), old.get("password", ""), old.get("method", "")) == (
+        item["type"], item["host"], item["port"], item["username"], item["password"], item["method"]
     ):
         print("已存在，未重复添加。")
         break
@@ -800,7 +879,8 @@ else:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    print(f"已添加：#{len(items)} {item['username']}@{item['host']}:{item['port']}")
+    label = item["username"] or item["method"]
+    print(f"已添加：#{len(items)} [{item['type']}] {label}@{item['host']}:{item['port']}")
 PY
   chmod 600 "$PROXY_LIST_FILE"
 }
@@ -818,11 +898,7 @@ PY
 
 test_current_egress() {
   local out
-  out=$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me 2>/dev/null || true)
-  if [[ -z "$out" ]]; then
-    out=$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ip.sb 2>/dev/null || true)
-  fi
-  if [[ -z "$out" ]]; then
+  if ! out="$(curl_egress_ip)"; then
     echo "出口测试失败"
     return 1
   fi
@@ -841,7 +917,7 @@ switch_with_rollback() {
     if test_current_egress; then
       echo "sing-box 已重启，当前出口已切换。"
     else
-      echo "新 SOCKS5 出口不可用，回滚到 #$old ..."
+      echo "新上游出口不可用，回滚到 #$old ..."
       proxy_apply_index "$old"
       sing-box check -c "$CONFIG_FILE"
       systemctl restart sing-box
@@ -877,13 +953,29 @@ with open(cfg_path, "r", encoding="utf-8") as f:
 
 old_proxy_ips = set()
 for outbound in cfg.get("outbounds", []):
-    if outbound.get("type") == "socks":
+    if outbound.get("tag") == "proxy":
         if outbound.get("server"):
             old_proxy_ips.add(str(outbound["server"]) + "/32")
-        outbound["server"] = resolved
-        outbound["server_port"] = int(item["port"])
-        outbound["username"] = item.get("username", "")
-        outbound["password"] = item.get("password", "")
+        outbound.clear()
+        if item.get("type", "socks5") == "shadowsocks":
+            outbound.update({
+                "type": "shadowsocks",
+                "tag": "proxy",
+                "server": resolved,
+                "server_port": int(item["port"]),
+                "method": item.get("method", ""),
+                "password": item.get("password", ""),
+            })
+        else:
+            outbound.update({
+                "type": "socks",
+                "tag": "proxy",
+                "server": resolved,
+                "server_port": int(item["port"]),
+                "version": "5",
+                "username": item.get("username", ""),
+                "password": item.get("password", ""),
+            })
 
 for old in items:
     try:
@@ -908,7 +1000,8 @@ with open(cfg_path, "w", encoding="utf-8") as f:
 with open(active_path, "w", encoding="utf-8") as f:
     f.write(str(idx) + "\n")
 
-print(f"已切换到 #{idx + 1}: {item.get('username','')}@{resolved}:{item['port']}")
+label = item.get("username") or item.get("method") or item.get("type", "proxy")
+print(f"已切换到 #{idx + 1}: [{item.get('type','socks5')}] {label}@{resolved}:{item['port']}")
 PY
   chmod 600 "$ACTIVE_PROXY_FILE" "$CONFIG_FILE"
 }
@@ -953,7 +1046,7 @@ with open(proxy_path, "r", encoding="utf-8") as f:
 if idx < 0 or idx >= len(items):
     raise SystemExit("序号无效")
 if len(items) <= 1:
-    raise SystemExit("至少要保留一个 SOCKS5 出口，不能删除最后一个")
+    raise SystemExit("至少要保留一个上游出口，不能删除最后一个")
 
 try:
     active = int(open(active_path, "r", encoding="utf-8").read().strip() or "0")
@@ -1055,8 +1148,7 @@ cmd_test() {
   fi
   printf 'IPv4 出口 IP   : '
   local out
-  out=$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me 2>/dev/null || true)
-  if [[ -z "$out" ]]; then
+  if ! out="$(curl_egress_ip)"; then
     echo "失败 — 请执行 sudo zck diag"
   else
     echo "$out"
@@ -1071,7 +1163,7 @@ cmd_test() {
       echo "== 小鸡 ($guest) =="
       printf 'IPv4 出口 IP   : '
       gout=$(incus exec "$guest" -- bash -lc \
-              "curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me" 2>/dev/null || true)
+              'for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" 2>/dev/null || true)"; [ -n "$out" ] && { echo "$out"; exit 0; }; done; exit 1' 2>/dev/null || true)
       if [[ -z "$gout" ]]; then
         echo "失败"
       else
@@ -1085,7 +1177,7 @@ cmd_diag() {
   echo "== 单元状态 =="
   systemctl --no-pager status egress-bypass sing-box 2>/dev/null || true
   echo
-  echo "== SOCKS5 出口列表 =="
+  echo "== 上游出口列表 =="
   proxy_list || true
   echo
   echo "== sing-box 最近日志 (last 60) =="
@@ -1110,15 +1202,15 @@ cmd_diag() {
   sysctl net.ipv4.ip_forward 2>/dev/null || true
   sysctl net.ipv6.conf.all.forwarding 2>/dev/null || true
   echo
-  echo "== SOCKS 服务器 TCP 连通性 =="
-  local srv prt
+  echo "== 上游服务器 TCP 连通性 =="
+  local srv prt typ
   read -r srv prt < <(python3 - <<'PY' 2>/dev/null
 import json
 try:
     with open("/etc/sing-box/config.json") as f:
         cfg = json.load(f)
     for o in cfg.get("outbounds", []):
-        if o.get("type") == "socks":
+        if o.get("tag") == "proxy":
             print(o.get("server",""), o.get("server_port","")); break
 except Exception:
     pass
@@ -1129,7 +1221,7 @@ PY
       if nc -z -w 5 "$srv" "$prt" 2>/dev/null; then
         echo "可达: $srv:$prt"
       else
-        echo "不可达: $srv:$prt  <-- 上游 SOCKS 服务器/防火墙/账号问题"
+        echo "不可达: $srv:$prt  <-- 上游服务器/防火墙问题"
       fi
     else
       echo "未安装 nc；上游地址：$srv:$prt"
@@ -1273,7 +1365,7 @@ SYSCTL
   if (( ok )); then
     touch "$ROLLBACK_SENTINEL"
     echo "全部就绪。验证出口 IP：sudo zck test"
-    echo "管理 SOCKS5 出口：sudo zck proxy list | add 用户名:密码@ip:端口 | switch"
+    echo "管理上游出口：sudo zck proxy list | add socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口 | switch"
     echo "若 IPv4 出口 IP 等于节点真实 IP，请运行 sudo zck diag 查看上游连通性。"
   else
     echo "存在失败项，请先按上面输出排查；详情请 sudo zck diag。"

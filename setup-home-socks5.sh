@@ -6,6 +6,7 @@
 #   sudo SOCKS_PORT=6013 bash setup-home-socks5.sh
 #   sudo SOCKS_HOST=home.example.com SOCKS_PORT=6013 bash setup-home-socks5.sh
 #   sudo SOCKS_PORT=6013 SOCKS_USER=myuser SOCKS_PASS=mypass bash setup-home-socks5.sh
+#   sudo SOCKS_TCP_MSS=1200 bash setup-home-socks5.sh
 set -euo pipefail
 trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
 
@@ -28,12 +29,17 @@ SOCKS_PORT="${SOCKS_PORT:-}"
 SOCKS_USER="${SOCKS_USER:-}"
 SOCKS_PASS="${SOCKS_PASS:-}"
 SOCKS_HOST="${SOCKS_HOST:-}"
+SOCKS_TCP_MSS="${SOCKS_TCP_MSS:-1200}"
 
 if [[ -z "$SOCKS_PORT" ]]; then
   read -rp "SOCKS5 监听端口 [6013]: " SOCKS_PORT
   SOCKS_PORT="${SOCKS_PORT:-6013}"
 fi
 valid_port "$SOCKS_PORT" || { echo "SOCKS5 端口无效: $SOCKS_PORT"; exit 1; }
+[[ "$SOCKS_TCP_MSS" =~ ^[0-9]+$ ]] && (( SOCKS_TCP_MSS >= 536 && SOCKS_TCP_MSS <= 1460 )) || {
+  echo "SOCKS_TCP_MSS 无效: $SOCKS_TCP_MSS，应在 536-1460 之间。"
+  exit 1
+}
 
 if [[ -z "$SOCKS_HOST" && -t 0 ]]; then
   echo "SOCKS5 对外连接地址应填写普通机器能连到的入口 IP/域名。"
@@ -104,6 +110,35 @@ echo "==> 放行本机防火墙端口"
 if command -v iptables >/dev/null 2>&1; then
   iptables -C INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT
+
+  cat > /usr/local/sbin/apply-home-socks5-mss <<EOF
+#!/usr/bin/env bash
+set -e
+PORT="${SOCKS_PORT}"
+MSS="${SOCKS_TCP_MSS}"
+iptables -t mangle -C PREROUTING -p tcp --dport "\$PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS" 2>/dev/null || \\
+  iptables -t mangle -I PREROUTING -p tcp --dport "\$PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS"
+iptables -t mangle -C OUTPUT -p tcp --sport "\$PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS" 2>/dev/null || \\
+  iptables -t mangle -I OUTPUT -p tcp --sport "\$PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS"
+EOF
+  chmod +x /usr/local/sbin/apply-home-socks5-mss
+
+  cat > /etc/systemd/system/home-socks5-mss.service <<'EOF'
+[Unit]
+Description=Clamp TCP MSS for home SOCKS5 service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/apply-home-socks5-mss
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now home-socks5-mss.service >/dev/null 2>&1 || true
 else
   echo "    [!] 未找到 iptables，跳过本机防火墙放行。请确认系统/云防火墙已放行 TCP ${SOCKS_PORT}。"
 fi
@@ -148,6 +183,7 @@ echo " 家宽 SOCKS5 服务端配置完成"
 echo "------------------------------------------------------------"
 echo " 网卡:      ${WAN_IF}"
 echo " 监听:      0.0.0.0:${SOCKS_PORT}"
+echo " TCP MSS:   ${SOCKS_TCP_MSS}"
 echo " 用户名:    ${SOCKS_USER}"
 echo " 密码:      ${SOCKS_PASS}"
 echo " SOCKS5:    ${SOCKS_URL}"
