@@ -238,6 +238,9 @@ iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --to-sou
 if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
   for proto in tcp udp; do
     comment="WG-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+    local_comment="WG-BE-LOCAL ${proto}:${PREFORWARD_RANGE}"
+    iptables -t nat -C PREROUTING -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$local_comment" -j REDIRECT 2>/dev/null || \
+      iptables -t nat -A PREROUTING -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$local_comment" -j REDIRECT
     iptables -C INPUT -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || \
       iptables -I INPUT -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT
   done
@@ -256,6 +259,8 @@ while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j RETURN 2>/dev/null; do :; done
 for proto in tcp udp; do
   comment="WG-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+  local_comment="WG-BE-LOCAL ${proto}:${PREFORWARD_RANGE}"
+  while iptables -t nat -D PREROUTING -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$local_comment" -j REDIRECT 2>/dev/null; do :; done
   while iptables -D INPUT -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null; do :; done
 done
 while iptables -D FORWARD -i "$WG_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
