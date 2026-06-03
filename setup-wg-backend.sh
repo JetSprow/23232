@@ -212,7 +212,7 @@ SYSCTL
 systemctl start "wg-quick@${WG_NAME}.service"
 
 ip route replace "$GUEST_SUBNET" dev "$INCUS_BRIDGE" table "$WG_TABLE"
-ip route replace default via "$GATEWAY_TUN_IP" dev "$WG_NAME" table "$WG_TABLE"
+ip route replace default dev "$WG_NAME" table "$WG_TABLE"
 ip rule del from "$GUEST_SUBNET" table "$WG_TABLE" pref "$WG_RULE_PREF" 2>/dev/null || true
 ip rule add from "$GUEST_SUBNET" table "$WG_TABLE" pref "$WG_RULE_PREF"
 ip rule del from "$BACKEND_TUN_IP" table "$WG_TABLE" pref "$((WG_RULE_PREF + 1))" 2>/dev/null || true
