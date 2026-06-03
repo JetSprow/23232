@@ -120,6 +120,11 @@ apt-get install -y -qq wireguard iproute2 iptables curl ca-certificates
 
 echo "==> 停止旧 GRE 网关，避免路由/防火墙冲突"
 systemctl disable --now gre-gateway.service >/dev/null 2>&1 || true
+ip route del "$GUEST_SUBNET" via 10.255.0.2 dev gre-incus 2>/dev/null || true
+ip tunnel del gre-incus 2>/dev/null || true
+for proto in tcp udp; do
+  while iptables -t nat -D PREROUTING -p "$proto" --dport "$PREFORWARD_RANGE" -j DNAT --to-destination 10.255.0.2 2>/dev/null; do :; done
+done
 
 WAN_IF="${WAN_IF:-$(ip -4 route show default | awk '/default/ {print $5; exit}')}"
 [[ -n "$WAN_IF" ]] || { echo "无法识别默认出口网卡"; exit 1; }

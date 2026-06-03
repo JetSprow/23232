@@ -123,6 +123,13 @@ apt-get install -y -qq wireguard iproute2 iptables curl ca-certificates
 
 echo "==> 停止旧 GRE 后端，避免路由/防火墙冲突"
 systemctl disable --now gre-backend.service >/dev/null 2>&1 || true
+while ip rule del from "$GUEST_SUBNET" table 2010 pref 2010 2>/dev/null; do :; done
+while ip rule del from 10.255.0.2 table 2010 pref 2011 2>/dev/null; do :; done
+ip route flush table 2010 2>/dev/null || true
+ip tunnel del gre-opt 2>/dev/null || true
+while iptables -D FORWARD -i "$INCUS_BRIDGE" -o gre-opt -j ACCEPT 2>/dev/null; do :; done
+while iptables -D FORWARD -i gre-opt -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o gre-opt -j RETURN 2>/dev/null; do :; done
 
 echo "==> 生成 WireGuard 密钥"
 mkdir -p /etc/wireguard "$STATE_DIR"
