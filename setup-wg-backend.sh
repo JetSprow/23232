@@ -205,8 +205,14 @@ set -euo pipefail
 source /etc/wg-backend/config.env
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${INCUS_BRIDGE}.rp_filter=0" >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${WG_NAME}.rp_filter=0" >/dev/null 2>&1 || true
 cat > /etc/sysctl.d/99-wg-backend.conf <<SYSCTL
 net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
 SYSCTL
 
 wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
@@ -227,7 +233,7 @@ iptables -t mangle -A FORWARD -i "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TC
 
 iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$WG_NAME" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$INCUS_BRIDGE" -o "$WG_NAME" -j ACCEPT
 iptables -C FORWARD -i "$WG_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WG_NAME" -o "$INCUS_BRIDGE" -j ACCEPT
-iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j RETURN 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$GUEST_SUBNET" -o "$WG_NAME" -j RETURN
+iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --to-source "$BACKEND_TUN_IP" 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --to-source "$BACKEND_TUN_IP"
 
 if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
   for proto in tcp udp; do
@@ -246,6 +252,7 @@ source /etc/wg-backend/config.env
 
 while iptables -t mangle -D FORWARD -o "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
 while iptables -t mangle -D FORWARD -i "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --to-source "$BACKEND_TUN_IP" 2>/dev/null; do :; done
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j RETURN 2>/dev/null; do :; done
 for proto in tcp udp; do
   comment="WG-BE-RANGE ${proto}:${PREFORWARD_RANGE}"

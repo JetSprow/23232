@@ -190,8 +190,13 @@ set -euo pipefail
 source /etc/wg-gateway/config.env
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w "net.ipv4.conf.${WG_NAME}.rp_filter=0" >/dev/null 2>&1 || true
 cat > /etc/sysctl.d/99-wg-gateway.conf <<SYSCTL
 net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
 SYSCTL
 
 wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
@@ -207,6 +212,7 @@ iptables -C INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || iptables -I
 iptables -C FORWARD -i "$WG_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WG_NAME" -o "$WAN_IF" -j ACCEPT
 iptables -C FORWARD -i "$WAN_IF" -o "$WG_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WAN_IF" -o "$WG_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || iptables -t nat -A POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP"
+iptables -t nat -C POSTROUTING -s "$BACKEND_TUN_IP" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || iptables -t nat -A POSTROUTING -s "$BACKEND_TUN_IP" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP"
 
 if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
   for proto in tcp udp; do
@@ -233,6 +239,7 @@ for proto in tcp udp; do
   while iptables -D FORWARD -i "$WAN_IF" -o "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null; do :; done
 done
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s "$BACKEND_TUN_IP" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$WAN_IF" -o "$WG_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$WG_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null; do :; done
