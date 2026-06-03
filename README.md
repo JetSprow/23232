@@ -9,6 +9,8 @@
 - `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5 或 Shadowsocks。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
+- `setup-wg-gateway.sh`：优化线路节点 WireGuard 网关，替代 GRE，适合 GRE 导致 HTTPS/TLS 卡住的线路。
+- `setup-wg-backend.sh`：普通 Incus 节点 WireGuard 后端，让小鸡通过 WG 走优化线路网关。
 - `diagnose-github-raw.sh`：诊断 `raw.githubusercontent.com`、`Check.Place` 等 HTTPS 连接卡住的问题。
 
 脚本默认面向 Debian/Ubuntu，需要 root 权限执行。
@@ -221,6 +223,55 @@ sudo GRE_MTU=1180 TCP_MSS=1140 GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBN
 ```bash
 incus exec 实例名 -- sh -lc 'apk update || true; wget -O- https://api.ipify.org'
 ```
+
+## WireGuard 优化线路模式
+
+如果 GRE 开启后小鸡访问 HTTPS/TLS 卡住，而关闭 `gre-be` 后立即恢复，优先改用 WireGuard 优化线路模式。它和 GRE 模式作用相同：小鸡仍创建在普通 Incus 节点，用户入口和小鸡出口走优化线路节点。
+
+1. 在普通 Incus 节点先生成后端公钥：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-wg-backend.sh -o setup-wg-backend.sh
+sudo GUEST_SUBNET=10.10.0.0/22 bash setup-wg-backend.sh
+```
+
+复制输出的“普通节点 WireGuard 公钥”。
+
+2. 在优化线路节点运行网关脚本，并粘贴普通节点公钥：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-wg-gateway.sh -o setup-wg-gateway.sh
+sudo WG_PORT=51820 GUEST_SUBNET=10.10.0.0/22 bash setup-wg-gateway.sh
+```
+
+复制输出的“网关地址、网关端口、网关公钥”。
+
+3. 回到普通 Incus 节点完成接入：
+
+```bash
+sudo GATEWAY_PUBLIC_IP=优化节点公网IP GATEWAY_PORT=51820 GATEWAY_PUBLIC_KEY='优化节点WG公钥' GUEST_SUBNET=10.10.0.0/22 bash setup-wg-backend.sh
+```
+
+4. 管理和测试：
+
+优化线路节点：
+
+```bash
+sudo wg-gw status
+sudo wg-gw off
+sudo wg-gw on
+```
+
+普通 Incus 节点：
+
+```bash
+sudo wg-be status
+sudo wg-be off
+sudo wg-be on
+incus exec 实例名 -- sh -lc 'apk update || true; wget -O- https://api.ipify.org'
+```
+
+WireGuard 模式默认预转发 `20000-30000` 的 TCP/UDP 到普通节点 WG IP，端口号保持不变。面板节点端口范围也应设置为 `20000-30000`，用户访问地址填优化线路节点公网 IP 或域名。
 
 脚本默认使用更保守的 WireGuard `MTU=1060` 和 TCP `MSS=1020`，避免部分家宽线路 TLS/HTTP2 卡住。如需手动指定：
 
