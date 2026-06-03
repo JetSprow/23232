@@ -78,7 +78,20 @@ disable_broken_backports_repo() {
   echo "==> 检测到 bullseye-backports 源不可用，自动禁用后重试"
   while IFS= read -r file; do
     [[ -f "$file" ]] || continue
-    sed -i.bak '/^[[:space:]]*deb .*bullseye-backports/s/^[[:space:]]*/# disabled by gre setup: /' "$file"
+    if ! grep -qi 'bullseye-backports' "$file"; then
+      continue
+    fi
+    cp -n "$file" "${file}.bak" 2>/dev/null || true
+    case "$file" in
+      *.sources)
+        mv "$file" "${file}.disabled"
+        echo "   disabled: ${file}"
+        ;;
+      *)
+        sed -i '/bullseye-backports/s/^[[:space:]]*\(deb\|deb-src\)[[:space:]]/# disabled by gre setup: &/' "$file"
+        echo "   patched:  ${file}"
+        ;;
+    esac
   done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null)
 }
 
@@ -91,7 +104,11 @@ apt_update_with_repair() {
   if grep -qi 'bullseye-backports.*Release file' "$log_file"; then
     cat "$log_file" >&2
     disable_broken_backports_repo
-    apt-get update -qq
+    if ! apt-get update -qq; then
+      echo "仍然存在异常 APT 源，请检查以下文件:" >&2
+      grep -Ril 'bullseye-backports' /etc/apt 2>/dev/null >&2 || true
+      return 1
+    fi
     rm -f "$log_file"
     return 0
   fi
