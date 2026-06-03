@@ -194,7 +194,8 @@ cat > /etc/sysctl.d/99-wg-gateway.conf <<SYSCTL
 net.ipv4.ip_forward=1
 SYSCTL
 
-systemctl start "wg-quick@${WG_NAME}.service"
+wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
+wg-quick up "$WG_NAME"
 ip route replace "$GUEST_SUBNET" via "$BACKEND_TUN_IP" dev "$WG_NAME"
 
 while iptables -t mangle -D FORWARD -o "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
@@ -236,7 +237,7 @@ while iptables -D FORWARD -i "$WAN_IF" -o "$WG_NAME" -m conntrack --ctstate RELA
 while iptables -D FORWARD -i "$WG_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null; do :; done
 ip route del "$GUEST_SUBNET" via "$BACKEND_TUN_IP" dev "$WG_NAME" 2>/dev/null || true
-systemctl stop "wg-quick@${WG_NAME}.service" 2>/dev/null || true
+wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
 EOF
 chmod +x "$REMOVE_BIN"
 
@@ -275,7 +276,7 @@ chmod +x "$HELPER_BIN"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=WireGuard optimized gateway
-After=network-online.target wg-quick@${WG_NAME}.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -290,7 +291,6 @@ EOF
 
 echo "==> 启动 WireGuard 网关"
 systemctl daemon-reload
-systemctl enable "wg-quick@${WG_NAME}.service" >/dev/null
 systemctl enable wg-gateway.service >/dev/null
 systemctl restart wg-gateway.service
 

@@ -209,7 +209,8 @@ cat > /etc/sysctl.d/99-wg-backend.conf <<SYSCTL
 net.ipv4.ip_forward=1
 SYSCTL
 
-systemctl start "wg-quick@${WG_NAME}.service"
+wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
+wg-quick up "$WG_NAME"
 
 ip route replace "$GUEST_SUBNET" dev "$INCUS_BRIDGE" table "$WG_TABLE"
 ip route replace default dev "$WG_NAME" table "$WG_TABLE"
@@ -256,7 +257,7 @@ ip rule del from "$BACKEND_TUN_IP" table "$WG_TABLE" pref "$((WG_RULE_PREF + 1))
 ip rule del from "$GUEST_SUBNET" table "$WG_TABLE" pref "$WG_RULE_PREF" 2>/dev/null || true
 ip route flush table "$WG_TABLE" 2>/dev/null || true
 ip route flush cache 2>/dev/null || true
-systemctl stop "wg-quick@${WG_NAME}.service" 2>/dev/null || true
+wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
 EOF
 chmod +x "$REMOVE_BIN"
 
@@ -293,7 +294,7 @@ chmod +x "$HELPER_BIN"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=WireGuard backend for optimized gateway
-After=network-online.target wg-quick@${WG_NAME}.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -308,7 +309,6 @@ EOF
 
 echo "==> 启动 WireGuard 后端"
 systemctl daemon-reload
-systemctl enable "wg-quick@${WG_NAME}.service" >/dev/null
 systemctl enable wg-backend.service >/dev/null
 systemctl restart wg-backend.service
 
