@@ -209,6 +209,19 @@ sudo gre-be restart
 
 注意：每个普通节点的小鸡网段必须唯一，例如 `10.10.0.0/22`、`10.14.0.0/22`、`10.18.0.0/22`，否则优化节点无法正确路由。
 
+GRE 默认使用较保守的 `MTU=1280` 和 TCP `MSS=1240`。如果开启 GRE 后小鸡访问 HTTPS/TLS 报错，而关闭 `gre-be` 后立即正常，优先继续降低 GRE MTU/MSS，并且两端必须使用相同值：
+
+```bash
+sudo GRE_MTU=1180 TCP_MSS=1140 BACKEND_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-gateway.sh
+sudo GRE_MTU=1180 TCP_MSS=1140 GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-backend.sh
+```
+
+测试小鸡 HTTPS：
+
+```bash
+incus exec 实例名 -- sh -lc 'apk update || true; wget -O- https://api.ipify.org'
+```
+
 脚本默认使用更保守的 WireGuard `MTU=1060` 和 TCP `MSS=1020`，避免部分家宽线路 TLS/HTTP2 卡住。如需手动指定：
 
 ```bash
