@@ -161,7 +161,27 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-gre-backe
 sudo GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-backend.sh
 ```
 
-3. 在优化线路节点添加端口转发：
+3. 端口转发：
+
+默认已开启整段预转发，优化线路节点会把 `20000-30000` 的 TCP/UDP 入口流量透传到普通 Incus 节点的 GRE IP，端口号保持不变。
+
+也就是说，面板用户创建 `20000-30000` 范围内的端口时，不需要再到优化线路节点手动添加 `gre-gw add`。优化线路节点负责“公网入口 -> 普通节点 GRE IP:同端口”，普通节点原有面板/Incus 端口规则继续负责“端口 -> 小鸡”。
+
+如需修改预转发范围，在两端使用相同的 `PREFORWARD_RANGE`：
+
+```bash
+sudo PREFORWARD_RANGE=20000:30000 BACKEND_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-gateway.sh
+sudo PREFORWARD_RANGE=20000:30000 GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-backend.sh
+```
+
+如需关闭整段预转发：
+
+```bash
+sudo PREFORWARD_ENABLE=0 BACKEND_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-gateway.sh
+sudo PREFORWARD_ENABLE=0 GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-backend.sh
+```
+
+仍然可以在优化线路节点手动添加单端口转发：
 
 ```bash
 sudo gre-gw add tcp 25022 小鸡IP 22

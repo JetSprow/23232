@@ -28,6 +28,8 @@ GUEST_SUBNET="${GUEST_SUBNET:-}"
 BACKEND_PUBLIC_IP="${BACKEND_PUBLIC_IP:-}"
 GATEWAY_PUBLIC_IP="${GATEWAY_PUBLIC_IP:-}"
 WAN_IF="${WAN_IF:-}"
+PREFORWARD_ENABLE="${PREFORWARD_ENABLE:-1}"
+PREFORWARD_RANGE="${PREFORWARD_RANGE:-20000:30000}"
 
 valid_ip_or_host() {
   [[ -n "$1" && "$1" != *:* ]]
@@ -78,6 +80,8 @@ BACKEND_TUN_IP=${BACKEND_TUN_IP}
 GRE_MTU=${GRE_MTU}
 TCP_MSS=${TCP_MSS}
 GUEST_SUBNET=${GUEST_SUBNET}
+PREFORWARD_ENABLE=${PREFORWARD_ENABLE}
+PREFORWARD_RANGE=${PREFORWARD_RANGE}
 EOF
 chmod 600 "$CONFIG_FILE"
 
@@ -103,6 +107,16 @@ iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -m conntrack --ctstate RELATED,E
 iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || iptables -t nat -A POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP"
 iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
 iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+
+if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+  for proto in tcp udp; do
+    comment="GRE-GW-RANGE ${proto}:${PREFORWARD_RANGE}->${BACKEND_TUN_IP}"
+    iptables -t nat -C PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j DNAT --to-destination "$BACKEND_TUN_IP" 2>/dev/null || \
+      iptables -t nat -A PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j DNAT --to-destination "$BACKEND_TUN_IP"
+    iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT
+  done
+fi
 EOF
 chmod +x "$APPLY_BIN"
 
@@ -113,6 +127,11 @@ source /etc/gre-gateway/config.env
 
 while iptables -t mangle -D FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
 while iptables -t mangle -D FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
+for proto in tcp udp; do
+  comment="GRE-GW-RANGE ${proto}:${PREFORWARD_RANGE}->${BACKEND_TUN_IP}"
+  while iptables -t nat -D PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j DNAT --to-destination "$BACKEND_TUN_IP" 2>/dev/null; do :; done
+  while iptables -D FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null; do :; done
+done
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$WAN_IF" -o "$GRE_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$GRE_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null; do :; done
@@ -141,6 +160,7 @@ usage() {
 
 说明:
   on/off/restart 只控制 GRE 隧道、核心路由和核心防火墙规则。
+  默认会把 ${PREFORWARD_RANGE} 整段 TCP/UDP 预转发到普通节点 GRE IP，端口号保持不变。
   add/del 管理公网端口到小鸡内网 IP 的转发规则。
 USAGE
 }
@@ -149,7 +169,8 @@ status() {
   systemctl is-active gre-gateway.service 2>/dev/null || true
   ip -brief addr show "$GRE_NAME" 2>/dev/null || true
   ip route show "$GUEST_SUBNET" 2>/dev/null || true
-  iptables -t nat -S | grep -E "GRE-GW|${GUEST_SUBNET}|${GRE_NAME}|DNAT" || true
+  echo "pre-forward: ${PREFORWARD_ENABLE:-1} ${PREFORWARD_RANGE:-}"
+  iptables -t nat -S | grep -E "GRE-GW|GRE-GW-RANGE|${GUEST_SUBNET}|${GRE_NAME}|DNAT" || true
 }
 
 add_forward() {
@@ -177,7 +198,7 @@ case "${1:-}" in
   off|disable|stop) systemctl disable --now gre-gateway.service ;;
   restart) systemctl restart gre-gateway.service ;;
   status) status ;;
-  list) iptables -t nat -S PREROUTING | grep 'GRE-GW' || true ;;
+  list) iptables -t nat -S PREROUTING | grep -E 'GRE-GW|GRE-GW-RANGE' || true ;;
   add) shift; [[ $# -eq 4 ]] || { usage; exit 1; }; add_forward "$@" ;;
   del|delete|rm) shift; [[ $# -eq 4 ]] || { usage; exit 1; }; del_forward "$@" ;;
   *) usage; exit 1 ;;
@@ -203,7 +224,8 @@ EOF
 
 echo "==> 启动 GRE 网关"
 systemctl daemon-reload
-systemctl enable --now gre-gateway.service
+systemctl enable gre-gateway.service >/dev/null
+systemctl restart gre-gateway.service
 
 echo
 echo "============================================================"
@@ -214,6 +236,7 @@ echo " 普通节点公网: ${BACKEND_RESOLVED_IP}"
 echo " GRE:          ${GATEWAY_TUN_IP}/30 -> ${BACKEND_TUN_IP}/30"
 echo " 小鸡网段:     ${GUEST_SUBNET}"
 echo " MTU/MSS:      MTU ${GRE_MTU}, TCP MSS ${TCP_MSS}"
+echo " 预转发端口:   ${PREFORWARD_ENABLE} (${PREFORWARD_RANGE})"
 echo "------------------------------------------------------------"
 echo " 一键开关:"
 echo "   sudo gre-gw on"
@@ -221,6 +244,9 @@ echo "   sudo gre-gw off"
 echo "   sudo gre-gw restart"
 echo " 添加端口转发示例:"
 echo "   sudo gre-gw add tcp 25022 10.10.0.123 22"
+echo " 预转发说明:"
+echo "   默认已将优化节点 ${PREFORWARD_RANGE} TCP/UDP 透传到普通节点 GRE IP，同端口保留。"
+echo "   面板用户创建同范围端口后，无需再手动 gre-gw add。"
 echo " 状态检查:"
 echo "   sudo gre-gw status"
 echo "============================================================"

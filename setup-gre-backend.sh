@@ -29,6 +29,8 @@ GUEST_SUBNET="${GUEST_SUBNET:-}"
 INCUS_BRIDGE="${INCUS_BRIDGE:-}"
 GATEWAY_PUBLIC_IP="${GATEWAY_PUBLIC_IP:-}"
 BACKEND_PUBLIC_IP="${BACKEND_PUBLIC_IP:-}"
+PREFORWARD_ENABLE="${PREFORWARD_ENABLE:-1}"
+PREFORWARD_RANGE="${PREFORWARD_RANGE:-20000:30000}"
 
 if [[ -z "$GATEWAY_PUBLIC_IP" ]]; then
   echo "优化线路节点地址说明: 填用户入口所在优化线路机器的公网 IPv4 或 A 记录域名。"
@@ -84,6 +86,8 @@ GUEST_SUBNET=${GUEST_SUBNET}
 INCUS_BRIDGE=${INCUS_BRIDGE}
 GRE_TABLE=${GRE_TABLE}
 GRE_RULE_PREF=${GRE_RULE_PREF}
+PREFORWARD_ENABLE=${PREFORWARD_ENABLE}
+PREFORWARD_RANGE=${PREFORWARD_RANGE}
 EOF
 chmod 600 "$CONFIG_FILE"
 
@@ -106,6 +110,8 @@ ip route replace "$GUEST_SUBNET" dev "$INCUS_BRIDGE" table "$GRE_TABLE"
 ip route replace default via "$GATEWAY_TUN_IP" dev "$GRE_NAME" table "$GRE_TABLE"
 ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev/null || true
 ip rule add from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF"
+ip rule del from "$BACKEND_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))" 2>/dev/null || true
+ip rule add from "$BACKEND_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))"
 ip route flush cache 2>/dev/null || true
 
 iptables -C INPUT -p 47 -s "$GATEWAY_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -I INPUT -p 47 -s "$GATEWAY_PUBLIC_IP" -j ACCEPT
@@ -114,6 +120,14 @@ iptables -C FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || i
 iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN
 iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
 iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+
+if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+  for proto in tcp udp; do
+    comment="GRE-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+    iptables -C INPUT -i "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || \
+      iptables -I INPUT -i "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT
+  done
+fi
 EOF
 chmod +x "$APPLY_BIN"
 
@@ -125,10 +139,15 @@ source /etc/gre-backend/config.env
 while iptables -t mangle -D FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
 while iptables -t mangle -D FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null; do :; done
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null; do :; done
+for proto in tcp udp; do
+  comment="GRE-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+  while iptables -D INPUT -i "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null; do :; done
+done
 while iptables -D FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D INPUT -p 47 -s "$GATEWAY_PUBLIC_IP" -j ACCEPT 2>/dev/null; do :; done
 
+ip rule del from "$BACKEND_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))" 2>/dev/null || true
 ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev/null || true
 ip route flush table "$GRE_TABLE" 2>/dev/null || true
 ip route flush cache 2>/dev/null || true
@@ -151,6 +170,7 @@ usage() {
 
 说明:
   这个命令运行在普通 Incus 节点，只控制小鸡走优化线路网关的 GRE 隧道。
+  默认放行来自 GRE 的 ${PREFORWARD_RANGE} TCP/UDP 预转发流量，配合面板端口转发使用。
   off 会关闭 GRE、删除小鸡源地址策略路由和核心防火墙规则，宿主机默认出口保持原线路。
 USAGE
 }
@@ -160,6 +180,7 @@ status() {
   ip -brief addr show "$GRE_NAME" 2>/dev/null || true
   ip rule show | grep -F "lookup ${GRE_TABLE}" || true
   ip route show table "$GRE_TABLE" 2>/dev/null || true
+  echo "pre-forward: ${PREFORWARD_ENABLE:-1} ${PREFORWARD_RANGE:-}"
   iptables -S | grep -E "${GRE_NAME}|${INCUS_BRIDGE}|${GATEWAY_PUBLIC_IP}" || true
   iptables -t nat -S POSTROUTING | grep -E "${GRE_NAME}|${GUEST_SUBNET}" || true
 }
@@ -192,7 +213,8 @@ EOF
 
 echo "==> 启动 GRE 后端"
 systemctl daemon-reload
-systemctl enable --now gre-backend.service
+systemctl enable gre-backend.service >/dev/null
+systemctl restart gre-backend.service
 
 echo
 echo "============================================================"
@@ -204,6 +226,7 @@ echo " GRE:          ${BACKEND_TUN_IP}/30 -> ${GATEWAY_TUN_IP}/30"
 echo " 小鸡网段:     ${GUEST_SUBNET}"
 echo " Incus Bridge: ${INCUS_BRIDGE}"
 echo " MTU/MSS:      MTU ${GRE_MTU}, TCP MSS ${TCP_MSS}"
+echo " 预转发端口:   ${PREFORWARD_ENABLE} (${PREFORWARD_RANGE})"
 echo "------------------------------------------------------------"
 echo " 一键开关:"
 echo "   sudo gre-be on"
