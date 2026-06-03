@@ -32,6 +32,71 @@ BACKEND_PUBLIC_IP="${BACKEND_PUBLIC_IP:-}"
 PREFORWARD_ENABLE="${PREFORWARD_ENABLE:-1}"
 PREFORWARD_RANGE="${PREFORWARD_RANGE:-20000:30000}"
 
+normalize_cidr() {
+  local cidr="$1" ip prefix a b c d ipnum mask net
+  if [[ ! "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    echo "CIDR 格式无效: $cidr" >&2
+    return 1
+  fi
+  ip="${cidr%/*}"
+  prefix="${cidr#*/}"
+  IFS=. read -r a b c d <<<"$ip"
+  for part in "$a" "$b" "$c" "$d"; do
+    if ((part < 0 || part > 255)); then
+      echo "CIDR 地址段超出范围: $cidr" >&2
+      return 1
+    fi
+  done
+  if ((prefix < 0 || prefix > 32)); then
+    echo "CIDR 掩码超出范围: $cidr" >&2
+    return 1
+  fi
+  ipnum=$(((a << 24) | (b << 16) | (c << 8) | d))
+  if ((prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xffffffff << (32 - prefix)) & 0xffffffff))
+  fi
+  net=$((ipnum & mask))
+  printf "%d.%d.%d.%d/%d\n" "$(((net >> 24) & 255))" "$(((net >> 16) & 255))" "$(((net >> 8) & 255))" "$((net & 255))" "$prefix"
+}
+
+normalize_guest_subnet() {
+  local normalized
+  normalized="$(normalize_cidr "$GUEST_SUBNET")" || exit 1
+  if [[ "$normalized" != "$GUEST_SUBNET" ]]; then
+    echo "小鸡网段已规范化: ${GUEST_SUBNET} -> ${normalized}"
+  fi
+  GUEST_SUBNET="$normalized"
+}
+
+disable_broken_backports_repo() {
+  local file
+  echo "==> 检测到 bullseye-backports 源不可用，自动禁用后重试"
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    sed -i.bak '/^[[:space:]]*deb .*bullseye-backports/s/^[[:space:]]*/# disabled by gre setup: /' "$file"
+  done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null)
+}
+
+apt_update_with_repair() {
+  local log_file="/tmp/gre-backend-apt-update.log"
+  if apt-get update -qq >"$log_file" 2>&1; then
+    rm -f "$log_file"
+    return 0
+  fi
+  if grep -qi 'bullseye-backports.*Release file' "$log_file"; then
+    cat "$log_file" >&2
+    disable_broken_backports_repo
+    apt-get update -qq
+    rm -f "$log_file"
+    return 0
+  fi
+  cat "$log_file" >&2
+  rm -f "$log_file"
+  return 1
+}
+
 if [[ -z "$GATEWAY_PUBLIC_IP" ]]; then
   echo "优化线路节点地址说明: 填用户入口所在优化线路机器的公网 IPv4 或 A 记录域名。"
   read -rp "优化线路节点公网 IPv4/域名: " GATEWAY_PUBLIC_IP
@@ -50,10 +115,11 @@ if [[ -z "$GUEST_SUBNET" ]]; then
   read -rp "小鸡/Incus bridge 网段 [10.10.0.0/22]: " GUEST_SUBNET
   GUEST_SUBNET="${GUEST_SUBNET:-10.10.0.0/22}"
 fi
+normalize_guest_subnet
 
 echo "==> 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+apt_update_with_repair
 apt-get install -y -qq iproute2 iptables curl ca-certificates
 
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
