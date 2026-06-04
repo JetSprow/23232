@@ -15,8 +15,12 @@ STATE_DIR="/etc/gre-gateway"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/gre-gateway-apply"
 REMOVE_BIN="/usr/local/sbin/gre-gateway-remove"
+CHECK_BIN="/usr/local/sbin/gre-gateway-check"
 HELPER_BIN="/usr/local/bin/gre-gw"
+RESTART_BIN="/usr/local/bin/gre-gateway-restart"
 UNIT_FILE="/etc/systemd/system/gre-gateway.service"
+CHECK_UNIT_FILE="/etc/systemd/system/gre-gateway-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/gre-gateway-check.timer"
 
 GRE_NAME="${GRE_NAME:-gre-incus}"
 GRE_TABLE="${GRE_TABLE:-}"
@@ -157,6 +161,7 @@ cat > "$CONFIG_FILE" <<EOF
 GRE_NAME=${GRE_NAME}
 WAN_IF=${WAN_IF}
 GATEWAY_PUBLIC_IP=${GATEWAY_PUBLIC_IP}
+BACKEND_ENDPOINT_HOST=${BACKEND_PUBLIC_IP}
 BACKEND_PUBLIC_IP=${BACKEND_RESOLVED_IP}
 GATEWAY_TUN_IP=${GATEWAY_TUN_IP}
 BACKEND_TUN_IP=${BACKEND_TUN_IP}
@@ -172,6 +177,33 @@ cat > "$APPLY_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/gre-gateway/config.env
+
+resolve_ipv4() {
+  local host="$1"
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  getent ahostsv4 "$host" | awk '{print $1; exit}'
+}
+
+set_config() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" 'BEGIN{done=0} index($0,key"=")==1{print key"="value; done=1; next} {print} END{if(!done) print key"="value}' /etc/gre-gateway/config.env > "$tmp"
+  cat "$tmp" > /etc/gre-gateway/config.env
+  rm -f "$tmp"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+current_public="$(ip -4 -o addr show dev "$WAN_IF" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+[[ -n "$current_public" ]] && GATEWAY_PUBLIC_IP="$current_public"
+resolved_backend="$(resolve_ipv4 "${BACKEND_ENDPOINT_HOST:-$BACKEND_PUBLIC_IP}" || true)"
+[[ -n "$resolved_backend" ]] && BACKEND_PUBLIC_IP="$resolved_backend"
+set_config WAN_IF "$WAN_IF"
+set_config GATEWAY_PUBLIC_IP "$GATEWAY_PUBLIC_IP"
+set_config BACKEND_PUBLIC_IP "$BACKEND_PUBLIC_IP"
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 cat > /etc/sysctl.d/99-gre-gateway.conf <<SYSCTL
@@ -213,6 +245,59 @@ fi
 EOF
 chmod +x "$APPLY_BIN"
 
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-gateway/config.env
+
+repair=0
+
+need_repair() {
+  repair=1
+  logger -t gre-gateway-check "$*"
+}
+
+resolve_ipv4() {
+  local host="$1"
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  getent ahostsv4 "$host" | awk '{print $1; exit}'
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+current_public=""
+[[ -n "$current_wan" ]] && current_public="$(ip -4 -o addr show dev "$current_wan" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+resolved_backend="$(resolve_ipv4 "${BACKEND_ENDPOINT_HOST:-$BACKEND_PUBLIC_IP}" || true)"
+
+[[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]] && need_repair "WAN interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+[[ -n "$current_public" && "$current_public" != "${GATEWAY_PUBLIC_IP:-}" ]] && need_repair "gateway public IPv4 changed: ${GATEWAY_PUBLIC_IP:-unknown} -> ${current_public}"
+[[ -n "$resolved_backend" && "$resolved_backend" != "${BACKEND_PUBLIC_IP:-}" ]] && need_repair "backend endpoint changed: ${BACKEND_PUBLIC_IP:-unknown} -> ${resolved_backend}"
+
+ip link show "$GRE_NAME" >/dev/null 2>&1 || need_repair "GRE interface missing"
+ip route show "$GUEST_SUBNET" | grep -F "via $BACKEND_TUN_IP" | grep -F "dev $GRE_NAME" >/dev/null || need_repair "missing guest subnet route"
+iptables -C INPUT -p 47 -s "${resolved_backend:-$BACKEND_PUBLIC_IP}" -j ACCEPT 2>/dev/null || need_repair "missing GRE input rule"
+iptables -C FORWARD -i "$GRE_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null || need_repair "missing GRE to WAN forward rule"
+iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || need_repair "missing WAN return forward rule"
+iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "${current_public:-$GATEWAY_PUBLIC_IP}" 2>/dev/null || need_repair "missing guest SNAT rule"
+iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing outbound TCPMSS rule"
+iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing inbound TCPMSS rule"
+
+if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+  for proto in tcp udp; do
+    comment="GRE-GW-RANGE ${proto}:${PREFORWARD_RANGE}->${BACKEND_TUN_IP}"
+    iptables -t nat -C PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j DNAT --to-destination "$BACKEND_TUN_IP" 2>/dev/null || need_repair "missing ${proto} range DNAT rule"
+    iptables -C FORWARD -i "$WAN_IF" -o "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || need_repair "missing ${proto} range FORWARD rule"
+  done
+fi
+
+if (( repair )); then
+  /usr/local/sbin/gre-gateway-apply
+fi
+EOF
+chmod +x "$CHECK_BIN"
+
 cat > "$REMOVE_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -248,7 +333,9 @@ usage() {
   sudo gre-gw on
   sudo gre-gw off
   sudo gre-gw restart
+  sudo gre-gw repair
   sudo gre-gw status
+  sudo gre-gw logs
   sudo gre-gw add tcp|udp 外部端口 小鸡IP 内部端口
   sudo gre-gw del tcp|udp 外部端口 小鸡IP 内部端口
   sudo gre-gw list
@@ -289,9 +376,11 @@ del_forward() {
 }
 
 case "${1:-}" in
-  on|enable|start) systemctl enable --now gre-gateway.service ;;
-  off|disable|stop) systemctl disable --now gre-gateway.service ;;
-  restart) systemctl restart gre-gateway.service ;;
+  on|enable|start) systemctl enable --now gre-gateway.service gre-gateway-check.timer ;;
+  off|disable|stop) systemctl disable --now gre-gateway-check.timer gre-gateway.service ;;
+  restart) /usr/local/bin/gre-gateway-restart ;;
+  repair|check) /usr/local/sbin/gre-gateway-check ;;
+  logs) journalctl -u gre-gateway.service -u gre-gateway-check.service --no-pager "${@:2}" ;;
   status) status ;;
   list) iptables -t nat -S PREROUTING | grep -E 'GRE-GW|GRE-GW-RANGE' || true ;;
   add) shift; [[ $# -eq 4 ]] || { usage; exit 1; }; add_forward "$@" ;;
@@ -300,6 +389,16 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$HELPER_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart gre-gateway.service
+systemctl enable --now gre-gateway-check.timer >/dev/null
+systemctl start gre-gateway-check.service >/dev/null 2>&1 || true
+gre-gw status
+EOF
+chmod +x "$RESTART_BIN"
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -312,15 +411,45 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=${APPLY_BIN}
 ExecStop=${REMOVE_BIN}
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=GRE optimized gateway self-healing check
+After=network-online.target gre-gateway.service
+Wants=network-online.target gre-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run GRE optimized gateway self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=gre-gateway-check.service
+
+[Install]
+WantedBy=timers.target
 EOF
 
 echo "==> 启动 GRE 网关"
 systemctl daemon-reload
 systemctl enable gre-gateway.service >/dev/null
 systemctl restart gre-gateway.service
+systemctl enable --now gre-gateway-check.timer >/dev/null
+systemctl start gre-gateway-check.service >/dev/null 2>&1 || true
 
 echo
 echo "============================================================"
@@ -337,6 +466,7 @@ echo " 一键开关:"
 echo "   sudo gre-gw on"
 echo "   sudo gre-gw off"
 echo "   sudo gre-gw restart"
+echo "   sudo gre-gw repair"
 echo " 添加端口转发示例:"
 echo "   sudo gre-gw add tcp 25022 10.10.0.123 22"
 echo " 预转发说明:"
@@ -344,4 +474,5 @@ echo "   默认已将优化节点 ${PREFORWARD_RANGE} TCP/UDP 透传到普通节
 echo "   面板用户创建同范围端口后，无需再手动 gre-gw add。"
 echo " 状态检查:"
 echo "   sudo gre-gw status"
+echo "   sudo gre-gw logs -n 80"
 echo "============================================================"

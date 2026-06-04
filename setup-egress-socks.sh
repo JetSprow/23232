@@ -95,6 +95,9 @@ BYPASS_NFT="$STATE_DIR/bypass.nft"
 BYPASS_APPLY="/usr/local/sbin/egress-bypass-apply"
 BYPASS_REMOVE="/usr/local/sbin/egress-bypass-remove"
 BYPASS_UNIT="/etc/systemd/system/egress-bypass.service"
+CHECK_BIN="/usr/local/sbin/egress-socks-check"
+CHECK_UNIT="/etc/systemd/system/egress-socks-check.service"
+CHECK_TIMER="/etc/systemd/system/egress-socks-check.timer"
 ROLLBACK_SENTINEL="/run/egress-socks-start-ok"
 ROLLBACK_SCRIPT="/run/egress-socks-rollback.sh"
 
@@ -753,8 +756,9 @@ usage() {
   logs      tail sing-box journal
   check     校验 sing-box 配置
   restart   重启 sing-box（保留 bypass）
-  off       停掉 sing-box 与 egress-bypass，恢复直连
-  on        重新启用 sing-box 与 egress-bypass
+  repair    自修复检查并补齐 sing-box / bypass / TUN
+  off       停掉 sing-box、egress-bypass 与自修复，恢复直连
+  on        重新启用 sing-box、egress-bypass 与自修复
 USAGE
 }
 
@@ -1236,14 +1240,21 @@ cmd_restart() {
   systemctl restart sing-box
   systemctl --no-pager status sing-box | head -10
 }
+cmd_repair() {
+  /usr/local/sbin/egress-socks-check
+  cmd_status
+}
 cmd_off() {
-  systemctl disable --now sing-box      >/dev/null 2>&1 || true
-  systemctl disable --now egress-bypass >/dev/null 2>&1 || true
+  systemctl disable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  systemctl disable --now sing-box                 >/dev/null 2>&1 || true
+  systemctl disable --now egress-bypass            >/dev/null 2>&1 || true
   echo "已关闭。流量恢复原始直连。"
 }
 cmd_on() {
-  systemctl enable --now egress-bypass >/dev/null 2>&1 || true
-  systemctl enable --now sing-box      >/dev/null 2>&1 || true
+  systemctl enable --now egress-bypass            >/dev/null 2>&1 || true
+  systemctl enable --now sing-box                 >/dev/null 2>&1 || true
+  systemctl enable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  systemctl start egress-socks-check.service      >/dev/null 2>&1 || true
   cmd_status
 }
 
@@ -1255,6 +1266,7 @@ case "${1:-status}" in
   logs)    cmd_logs    ;;
   check)   cmd_check   ;;
   restart) cmd_restart ;;
+  repair)  cmd_repair  ;;
   off)     cmd_off     ;;
   on)      cmd_on      ;;
   -h|--help|help) usage ;;
@@ -1262,6 +1274,99 @@ case "${1:-status}" in
 esac
 EOF
   chmod +x "$HELPER_BIN"
+}
+
+install_self_heal() {
+  cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/sing-box/config.json"
+TUN_NAME="$(python3 - 2>/dev/null <<'PY' || echo egress-tun0
+import json
+try:
+    with open("/etc/sing-box/config.json") as f:
+        cfg = json.load(f)
+    for ib in cfg.get("inbounds", []):
+        if ib.get("type") == "tun":
+            print(ib.get("interface_name", "egress-tun0"))
+            break
+    else:
+        print("egress-tun0")
+except Exception:
+    print("egress-tun0")
+PY
+)"
+
+repair=0
+restart_singbox=0
+
+need_repair() {
+  repair=1
+  logger -t egress-socks-check "$*"
+}
+
+sing-box check -c "$CONFIG_FILE" >/dev/null || {
+  logger -t egress-socks-check "sing-box config check failed"
+  exit 1
+}
+
+systemctl is-active --quiet egress-bypass.service || need_repair "egress-bypass is not running"
+nft list table inet egress-bypass >/dev/null 2>&1 || need_repair "egress-bypass nft table missing"
+ip -4 rule show | grep -q 'fwmark 0x42 lookup main' || need_repair "egress bypass fwmark rule missing"
+
+if ! systemctl is-active --quiet sing-box.service; then
+  restart_singbox=1
+  need_repair "sing-box is not running"
+fi
+ip link show "$TUN_NAME" >/dev/null 2>&1 || {
+  restart_singbox=1
+  need_repair "TUN interface ${TUN_NAME} is missing"
+}
+
+if (( repair )); then
+  systemctl restart egress-bypass.service || true
+fi
+if (( restart_singbox )); then
+  systemctl restart sing-box.service || true
+fi
+EOF
+  chmod 755 "$CHECK_BIN"
+
+  cat > "$CHECK_UNIT" <<EOF
+[Unit]
+Description=Egress SOCKS self-healing check
+After=network-online.target egress-bypass.service sing-box.service
+Wants=network-online.target egress-bypass.service sing-box.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+  cat > "$CHECK_TIMER" <<'EOF'
+[Unit]
+Description=Run Egress SOCKS self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=egress-socks-check.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  mkdir -p /etc/systemd/system/sing-box.service.d
+  cat > /etc/systemd/system/sing-box.service.d/20-egress-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+  systemctl daemon-reload
+  systemctl enable --now egress-socks-check.timer >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -1379,6 +1484,7 @@ main() {
   write_singbox_config
   write_bypass_unit
   install_helper
+  install_self_heal
   enable_and_verify
 }
 

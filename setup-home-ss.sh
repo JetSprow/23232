@@ -44,6 +44,14 @@ SS_PORT="${SS_PORT:-}"
 SS_HOST="${SS_HOST:-}"
 SS_METHOD="${SS_METHOD:-aes-256-gcm}"
 SS_PASSWORD="${SS_PASSWORD:-}"
+STATE_DIR="/etc/home-ss"
+CONFIG_FILE="$STATE_DIR/config.env"
+APPLY_BIN="/usr/local/sbin/home-ss-apply"
+CHECK_BIN="/usr/local/sbin/home-ss-check"
+RESTART_BIN="/usr/local/bin/home-ss-restart"
+HELPER_BIN="/usr/local/bin/home-ss"
+CHECK_UNIT_FILE="/etc/systemd/system/home-ss-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/home-ss-check.timer"
 
 if [[ -z "$SS_PORT" ]]; then
   read -rp "Shadowsocks 监听端口 [6013]: " SS_PORT
@@ -155,6 +163,118 @@ SS_HOST="${SS_HOST:-$LOCAL_IP}"
 
 SS_URL="ss://${SS_METHOD}:${SS_PASSWORD}@${SS_HOST}:${SS_PORT}"
 
+echo "==> 写入持久化运维脚本"
+mkdir -p "$STATE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+SS_PORT=${SS_PORT}
+SS_HOST=${SS_HOST}
+SS_METHOD=${SS_METHOD}
+WAN_IF=${WAN_IF}
+LOCAL_IP=${LOCAL_IP}
+EOF
+chmod 600 "$CONFIG_FILE"
+
+cat > "$APPLY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-ss/config.env
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+
+iptables -C INPUT -p tcp --dport "$SS_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$SS_PORT" -j ACCEPT
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "${SS_PORT}/tcp" >/dev/null || true
+fi
+
+if ! systemctl is-active --quiet home-ss.service; then
+  systemctl restart home-ss.service
+fi
+
+tmp="$(mktemp)"
+awk -v wan="$WAN_IF" 'BEGIN{done=0} /^WAN_IF=/{print "WAN_IF=" wan; done=1; next} {print} END{if(!done) print "WAN_IF=" wan}' /etc/home-ss/config.env > "$tmp"
+cat "$tmp" > /etc/home-ss/config.env
+rm -f "$tmp"
+EOF
+chmod 755 "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-ss/config.env
+
+repair=0
+need_repair() {
+  repair=1
+  logger -t home-ss-check "$*"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]] && need_repair "WAN interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+systemctl is-active --quiet home-ss.service || need_repair "home-ss is not running"
+ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\.)${SS_PORT}$" || need_repair "SS port ${SS_PORT} is not listening"
+iptables -C INPUT -p tcp --dport "$SS_PORT" -j ACCEPT 2>/dev/null || need_repair "missing TCP input rule"
+
+if (( repair )); then
+  /usr/local/sbin/home-ss-apply
+fi
+EOF
+chmod 755 "$CHECK_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart home-ss.service
+/usr/local/sbin/home-ss-apply
+systemctl enable --now home-ss-check.timer >/dev/null
+systemctl start home-ss-check.service >/dev/null 2>&1 || true
+home-ss status
+EOF
+chmod 755 "$RESTART_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-ss/config.env
+case "${1:-status}" in
+  status) systemctl status home-ss.service home-ss-check.timer --no-pager --lines=8; ss -ltnp 2>/dev/null | grep ":${SS_PORT}" || true ;;
+  check|repair) /usr/local/sbin/home-ss-check ;;
+  apply) /usr/local/sbin/home-ss-apply ;;
+  restart) /usr/local/bin/home-ss-restart ;;
+  logs) journalctl -u home-ss.service -u home-ss-check.service --no-pager "${@:2}" ;;
+  *) echo "usage: home-ss status|check|apply|restart|logs" >&2; exit 2 ;;
+esac
+EOF
+chmod 755 "$HELPER_BIN"
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=Home Shadowsocks self-healing check
+After=network-online.target home-ss.service
+Wants=network-online.target home-ss.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run Home Shadowsocks self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=home-ss-check.service
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now home-ss-check.timer >/dev/null 2>&1 || true
+
 echo
 echo "============================================================"
 echo " 家宽 Shadowsocks 服务端配置完成"
@@ -172,5 +292,6 @@ echo "   sudo zck restart"
 echo "   sudo zck test"
 echo "------------------------------------------------------------"
 echo " 注意: 云防火墙/路由器也需要放行 TCP ${SS_PORT}。"
-echo " 日志: journalctl -u home-ss -f --no-pager"
+echo " 自修复: home-ss-check.timer 每 60 秒检查服务/端口/规则"
+echo " 管理: home-ss status | home-ss restart | home-ss logs -n 80"
 echo "============================================================"

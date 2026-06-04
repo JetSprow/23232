@@ -15,8 +15,12 @@ STATE_DIR="/etc/gre-backend"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/gre-backend-apply"
 REMOVE_BIN="/usr/local/sbin/gre-backend-remove"
+CHECK_BIN="/usr/local/sbin/gre-backend-check"
 HELPER_BIN="/usr/local/bin/gre-be"
+RESTART_BIN="/usr/local/bin/gre-backend-restart"
 UNIT_FILE="/etc/systemd/system/gre-backend.service"
+CHECK_UNIT_FILE="/etc/systemd/system/gre-backend-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/gre-backend-check.timer"
 
 GRE_NAME="${GRE_NAME:-gre-opt}"
 GRE_TABLE="${GRE_TABLE:-2010}"
@@ -160,6 +164,7 @@ cat > "$CONFIG_FILE" <<EOF
 GRE_NAME=${GRE_NAME}
 WAN_IF=${WAN_IF}
 BACKEND_PUBLIC_IP=${BACKEND_PUBLIC_IP}
+GATEWAY_ENDPOINT_HOST=${GATEWAY_PUBLIC_IP}
 GATEWAY_PUBLIC_IP=${GATEWAY_RESOLVED_IP}
 GATEWAY_TUN_IP=${GATEWAY_TUN_IP}
 BACKEND_TUN_IP=${BACKEND_TUN_IP}
@@ -178,6 +183,33 @@ cat > "$APPLY_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/gre-backend/config.env
+
+resolve_ipv4() {
+  local host="$1"
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  getent ahostsv4 "$host" | awk '{print $1; exit}'
+}
+
+set_config() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" 'BEGIN{done=0} index($0,key"=")==1{print key"="value; done=1; next} {print} END{if(!done) print key"="value}' /etc/gre-backend/config.env > "$tmp"
+  cat "$tmp" > /etc/gre-backend/config.env
+  rm -f "$tmp"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+current_public="$(ip -4 -o addr show dev "$WAN_IF" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+[[ -n "$current_public" ]] && BACKEND_PUBLIC_IP="$current_public"
+resolved_gateway="$(resolve_ipv4 "${GATEWAY_ENDPOINT_HOST:-$GATEWAY_PUBLIC_IP}" || true)"
+[[ -n "$resolved_gateway" ]] && GATEWAY_PUBLIC_IP="$resolved_gateway"
+set_config WAN_IF "$WAN_IF"
+set_config BACKEND_PUBLIC_IP "$BACKEND_PUBLIC_IP"
+set_config GATEWAY_PUBLIC_IP "$GATEWAY_PUBLIC_IP"
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 cat > /etc/sysctl.d/99-gre-backend.conf <<SYSCTL
@@ -224,6 +256,61 @@ fi
 EOF
 chmod +x "$APPLY_BIN"
 
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/gre-backend/config.env
+
+repair=0
+
+need_repair() {
+  repair=1
+  logger -t gre-backend-check "$*"
+}
+
+resolve_ipv4() {
+  local host="$1"
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  getent ahostsv4 "$host" | awk '{print $1; exit}'
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+current_public=""
+[[ -n "$current_wan" ]] && current_public="$(ip -4 -o addr show dev "$current_wan" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+resolved_gateway="$(resolve_ipv4 "${GATEWAY_ENDPOINT_HOST:-$GATEWAY_PUBLIC_IP}" || true)"
+
+[[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]] && need_repair "WAN interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+[[ -n "$current_public" && "$current_public" != "${BACKEND_PUBLIC_IP:-}" ]] && need_repair "backend public IPv4 changed: ${BACKEND_PUBLIC_IP:-unknown} -> ${current_public}"
+[[ -n "$resolved_gateway" && "$resolved_gateway" != "${GATEWAY_PUBLIC_IP:-}" ]] && need_repair "gateway endpoint changed: ${GATEWAY_PUBLIC_IP:-unknown} -> ${resolved_gateway}"
+
+ip link show "$GRE_NAME" >/dev/null 2>&1 || need_repair "GRE interface missing"
+ip route show table "$GRE_TABLE" | grep -Eq "^default via ${GATEWAY_TUN_IP} dev ${GRE_NAME}( |$)" || need_repair "missing optimized default route"
+ip route show table "$GRE_TABLE" | grep -F "$GUEST_SUBNET" | grep -F "dev $INCUS_BRIDGE" >/dev/null || need_repair "missing guest subnet route"
+ip rule show | grep -F "from $GUEST_SUBNET lookup $GRE_TABLE" >/dev/null || need_repair "missing guest subnet ip rule"
+ip rule show | grep -F "from $BACKEND_TUN_IP lookup $GRE_TABLE" >/dev/null || need_repair "missing backend tunnel ip rule"
+iptables -C INPUT -p 47 -s "${resolved_gateway:-$GATEWAY_PUBLIC_IP}" -j ACCEPT 2>/dev/null || need_repair "missing GRE input rule"
+iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null || need_repair "missing guest to GRE forward rule"
+iptables -C FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || need_repair "missing GRE to guest forward rule"
+iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null || need_repair "missing NAT return rule"
+iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing outbound TCPMSS rule"
+iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing inbound TCPMSS rule"
+
+if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+  for proto in tcp udp; do
+    comment="GRE-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+    iptables -C INPUT -i "$GRE_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || need_repair "missing ${proto} range INPUT rule"
+  done
+fi
+
+if (( repair )); then
+  /usr/local/sbin/gre-backend-apply
+fi
+EOF
+chmod +x "$CHECK_BIN"
+
 cat > "$REMOVE_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -261,7 +348,9 @@ usage() {
   sudo gre-be on
   sudo gre-be off
   sudo gre-be restart
+  sudo gre-be repair
   sudo gre-be status
+  sudo gre-be logs
 
 说明:
   这个命令运行在普通 Incus 节点，只控制小鸡走优化线路网关的 GRE 隧道。
@@ -281,14 +370,26 @@ status() {
 }
 
 case "${1:-}" in
-  on|enable|start) systemctl enable --now gre-backend.service ;;
-  off|disable|stop) systemctl disable --now gre-backend.service ;;
-  restart) systemctl restart gre-backend.service ;;
+  on|enable|start) systemctl enable --now gre-backend.service gre-backend-check.timer ;;
+  off|disable|stop) systemctl disable --now gre-backend-check.timer gre-backend.service ;;
+  restart) /usr/local/bin/gre-backend-restart ;;
+  repair|check) /usr/local/sbin/gre-backend-check ;;
+  logs) journalctl -u gre-backend.service -u gre-backend-check.service --no-pager "${@:2}" ;;
   status) status ;;
   *) usage; exit 1 ;;
 esac
 EOF
 chmod +x "$HELPER_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart gre-backend.service
+systemctl enable --now gre-backend-check.timer >/dev/null
+systemctl start gre-backend-check.service >/dev/null 2>&1 || true
+gre-be status
+EOF
+chmod +x "$RESTART_BIN"
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -301,15 +402,45 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=${APPLY_BIN}
 ExecStop=${REMOVE_BIN}
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=GRE backend self-healing check
+After=network-online.target gre-backend.service
+Wants=network-online.target gre-backend.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run GRE backend self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=gre-backend-check.service
+
+[Install]
+WantedBy=timers.target
 EOF
 
 echo "==> 启动 GRE 后端"
 systemctl daemon-reload
 systemctl enable gre-backend.service >/dev/null
 systemctl restart gre-backend.service
+systemctl enable --now gre-backend-check.timer >/dev/null
+systemctl start gre-backend-check.service >/dev/null 2>&1 || true
 
 echo
 echo "============================================================"
@@ -327,8 +458,10 @@ echo " 一键开关:"
 echo "   sudo gre-be on"
 echo "   sudo gre-be off"
 echo "   sudo gre-be restart"
+echo "   sudo gre-be repair"
 echo " 检查:"
 echo "   sudo gre-be status"
+echo "   sudo gre-be logs -n 80"
 echo "   ip addr show ${GRE_NAME}"
 echo "   ip rule show | grep ${GRE_TABLE}"
 echo "   ping -c 3 ${GATEWAY_TUN_IP}"

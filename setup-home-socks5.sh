@@ -30,6 +30,14 @@ SOCKS_USER="${SOCKS_USER:-}"
 SOCKS_PASS="${SOCKS_PASS:-}"
 SOCKS_HOST="${SOCKS_HOST:-}"
 SOCKS_TCP_MSS="${SOCKS_TCP_MSS:-1200}"
+STATE_DIR="/etc/home-socks5"
+CONFIG_FILE="$STATE_DIR/config.env"
+APPLY_BIN="/usr/local/sbin/home-socks5-apply"
+CHECK_BIN="/usr/local/sbin/home-socks5-check"
+RESTART_BIN="/usr/local/bin/home-socks5-restart"
+HELPER_BIN="/usr/local/bin/home-socks5"
+CHECK_UNIT_FILE="/etc/systemd/system/home-socks5-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/home-socks5-check.timer"
 
 if [[ -z "$SOCKS_PORT" ]]; then
   read -rp "SOCKS5 监听端口 [6013]: " SOCKS_PORT
@@ -170,6 +178,135 @@ fi
 
 SOCKS_URL="socks5://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_HOST}:${SOCKS_PORT}"
 
+echo "==> 写入持久化运维脚本"
+mkdir -p "$STATE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+SOCKS_PORT=${SOCKS_PORT}
+SOCKS_USER=${SOCKS_USER}
+SOCKS_HOST=${SOCKS_HOST}
+SOCKS_TCP_MSS=${SOCKS_TCP_MSS}
+WAN_IF=${WAN_IF}
+LOCAL_IP=${LOCAL_IP}
+EOF
+chmod 600 "$CONFIG_FILE"
+
+cat > "$APPLY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-socks5/config.env
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+
+if ! grep -q "internal: 0.0.0.0 port = ${SOCKS_PORT}" /etc/danted.conf 2>/dev/null || ! grep -q "external: ${WAN_IF}" /etc/danted.conf 2>/dev/null; then
+  sed -i "s/^internal:.*/internal: 0.0.0.0 port = ${SOCKS_PORT}/; s/^external:.*/external: ${WAN_IF}/" /etc/danted.conf
+fi
+
+iptables -C INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT
+iptables -t mangle -C PREROUTING -p tcp --dport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS" 2>/dev/null || iptables -t mangle -I PREROUTING -p tcp --dport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS"
+iptables -t mangle -C OUTPUT -p tcp --sport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS" 2>/dev/null || iptables -t mangle -I OUTPUT -p tcp --sport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS"
+
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "${SOCKS_PORT}/tcp" >/dev/null || true
+fi
+
+if ! systemctl is-active --quiet danted; then
+  systemctl restart danted
+fi
+
+tmp="$(mktemp)"
+awk -v wan="$WAN_IF" 'BEGIN{done=0} /^WAN_IF=/{print "WAN_IF=" wan; done=1; next} {print} END{if(!done) print "WAN_IF=" wan}' /etc/home-socks5/config.env > "$tmp"
+cat "$tmp" > /etc/home-socks5/config.env
+rm -f "$tmp"
+EOF
+chmod 755 "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-socks5/config.env
+
+repair=0
+need_repair() {
+  repair=1
+  logger -t home-socks5-check "$*"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]] && need_repair "WAN interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+systemctl is-active --quiet danted || need_repair "danted is not running"
+ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\.)${SOCKS_PORT}$" || need_repair "SOCKS5 port ${SOCKS_PORT} is not listening"
+iptables -C INPUT -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null || need_repair "missing TCP input rule"
+iptables -t mangle -C PREROUTING -p tcp --dport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS" 2>/dev/null || need_repair "missing PREROUTING MSS rule"
+iptables -t mangle -C OUTPUT -p tcp --sport "$SOCKS_PORT" --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$SOCKS_TCP_MSS" 2>/dev/null || need_repair "missing OUTPUT MSS rule"
+
+if (( repair )); then
+  /usr/local/sbin/home-socks5-apply
+fi
+EOF
+chmod 755 "$CHECK_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart danted
+/usr/local/sbin/home-socks5-apply
+systemctl enable --now home-socks5-check.timer >/dev/null
+systemctl start home-socks5-check.service >/dev/null 2>&1 || true
+home-socks5 status
+EOF
+chmod 755 "$RESTART_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/home-socks5/config.env
+case "${1:-status}" in
+  status) systemctl status danted home-socks5-check.timer --no-pager --lines=8; ss -ltnp 2>/dev/null | grep ":${SOCKS_PORT}" || true ;;
+  check|repair) /usr/local/sbin/home-socks5-check ;;
+  apply) /usr/local/sbin/home-socks5-apply ;;
+  restart) /usr/local/bin/home-socks5-restart ;;
+  logs) journalctl -u danted -u home-socks5-check.service --no-pager "${@:2}" ;;
+  *) echo "usage: home-socks5 status|check|apply|restart|logs" >&2; exit 2 ;;
+esac
+EOF
+chmod 755 "$HELPER_BIN"
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=Home SOCKS5 self-healing check
+After=network-online.target danted.service home-socks5-mss.service
+Wants=network-online.target danted.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run Home SOCKS5 self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=home-socks5-check.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+mkdir -p /etc/systemd/system/danted.service.d
+cat > /etc/systemd/system/danted.service.d/10-home-socks5-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+systemctl daemon-reload
+systemctl enable --now home-socks5-check.timer >/dev/null 2>&1 || true
+
 echo "==> 本机连通性测试"
 if curl -4 -fsS --connect-timeout 8 --max-time 20 --proxy "socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" https://ip.sb >/tmp/home-socks5-test.out 2>/tmp/home-socks5-test.err; then
   echo "    [OK] SOCKS5 本机测试通过，出口 IP: $(tr -d '\r\n' </tmp/home-socks5-test.out)"
@@ -194,5 +331,6 @@ echo "   sudo zck proxy switch"
 echo "   sudo zck test"
 echo "------------------------------------------------------------"
 echo " 注意: 云防火墙/路由器也需要放行 TCP ${SOCKS_PORT}。"
-echo " 日志: journalctl -u danted -f --no-pager"
+echo " 自修复: home-socks5-check.timer 每 60 秒检查服务/端口/规则"
+echo " 管理: home-socks5 status | home-socks5 restart | home-socks5 logs -n 80"
 echo "============================================================"

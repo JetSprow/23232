@@ -139,6 +139,77 @@ sudo zck restart
 sudo zck test
 ```
 
+## 自动化运维和自修复
+
+除 `diagnose-github-raw.sh` 这种一次性诊断脚本外，安装型脚本都会写入 systemd 服务、定时检查器和快捷管理命令。重启机器后会自动恢复；服务、路由、防火墙、MSS、预转发等关键规则丢失时会自动补回。
+
+家宽 WireGuard 出口：
+
+```bash
+sudo wg-home status
+sudo wg-home check
+sudo wg-home restart
+sudo wg-home logs -n 80
+```
+
+普通 WireGuard 客户端：
+
+```bash
+sudo wg-normal status
+sudo wg-normal check
+sudo wg-normal restart
+sudo wg-normal logs -n 80
+```
+
+家宽 SOCKS5 / Shadowsocks：
+
+```bash
+sudo home-socks5 status
+sudo home-socks5 restart
+sudo home-socks5 logs -n 80
+
+sudo home-ss status
+sudo home-ss restart
+sudo home-ss logs -n 80
+```
+
+普通机器代理出口：
+
+```bash
+sudo zck status
+sudo zck repair
+sudo zck restart
+sudo zck diag
+```
+
+GRE / WireGuard 优化线路：
+
+```bash
+sudo gre-gw status
+sudo gre-gw repair
+sudo gre-gw restart
+sudo gre-gw logs -n 80
+
+sudo gre-be status
+sudo gre-be repair
+sudo gre-be restart
+sudo gre-be logs -n 80
+
+sudo wg-gw status
+sudo wg-gw repair
+sudo wg-gw restart
+
+sudo wg-be status
+sudo wg-be repair
+sudo wg-be restart
+```
+
+定时器状态：
+
+```bash
+systemctl list-timers '*check.timer' --no-pager
+```
+
 ## GRE 优化线路模式
 
 适合“用户 -> 优化线路节点 -> 普通 Incus 节点小鸡”的模式。小鸡仍创建在普通节点，公网入口和出口都走优化节点。
@@ -198,6 +269,8 @@ sudo gre-gw status
 sudo gre-gw off
 sudo gre-gw on
 sudo gre-gw restart
+sudo gre-gw repair
+sudo gre-gw logs -n 80
 ```
 
 普通 Incus 节点：
@@ -207,6 +280,8 @@ sudo gre-be status
 sudo gre-be off
 sudo gre-be on
 sudo gre-be restart
+sudo gre-be repair
+sudo gre-be logs -n 80
 ```
 
 注意：每个普通节点的小鸡网段必须唯一，例如 `10.10.0.0/22`、`10.14.0.0/22`、`10.18.0.0/22`，否则优化节点无法正确路由。
