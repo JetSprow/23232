@@ -12,8 +12,12 @@ STATE_DIR="/etc/wg-gateway"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/wg-gateway-apply"
 REMOVE_BIN="/usr/local/sbin/wg-gateway-remove"
+CHECK_BIN="/usr/local/sbin/wg-gateway-check"
 HELPER_BIN="/usr/local/bin/wg-gw"
+RESTART_BIN="/usr/local/bin/wg-opt-restart"
 UNIT_FILE="/etc/systemd/system/wg-gateway.service"
+CHECK_UNIT_FILE="/etc/systemd/system/wg-gateway-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/wg-gateway-check.timer"
 
 WG_NAME="${WG_NAME:-wg-opt}"
 WG_PORT="${WG_PORT:-51820}"
@@ -199,8 +203,9 @@ net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 SYSCTL
 
-wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
-wg-quick up "$WG_NAME"
+if ! wg show "$WG_NAME" >/dev/null 2>&1; then
+  wg-quick up "$WG_NAME"
+fi
 ip route replace "$GUEST_SUBNET" via "$BACKEND_TUN_IP" dev "$WG_NAME"
 
 while iptables -t mangle -D FORWARD -o "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
@@ -225,6 +230,46 @@ if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
 fi
 EOF
 chmod +x "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-gateway/config.env
+
+repair_needed=0
+
+need_repair() {
+  repair_needed=1
+  logger -t wg-gateway-check "$*"
+}
+
+if ! wg show "$WG_NAME" >/dev/null 2>&1; then
+  need_repair "WireGuard interface ${WG_NAME} is missing"
+else
+  ip route show "$GUEST_SUBNET" | grep -F "via $BACKEND_TUN_IP" | grep -F "dev $WG_NAME" >/dev/null || need_repair "missing guest subnet route"
+
+  iptables -t mangle -C FORWARD -o "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing outbound TCPMSS rule"
+  iptables -t mangle -C FORWARD -i "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing inbound TCPMSS rule"
+  iptables -C INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || need_repair "missing WireGuard UDP input rule"
+  iptables -C FORWARD -i "$WG_NAME" -o "$WAN_IF" -j ACCEPT 2>/dev/null || need_repair "missing WireGuard to WAN forward rule"
+  iptables -C FORWARD -i "$WAN_IF" -o "$WG_NAME" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || need_repair "missing WAN return forward rule"
+  iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || need_repair "missing guest subnet SNAT rule"
+  iptables -t nat -C POSTROUTING -s "$BACKEND_TUN_IP" -o "$WAN_IF" -j SNAT --to-source "$GATEWAY_PUBLIC_IP" 2>/dev/null || need_repair "missing backend tunnel SNAT rule"
+
+  if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+    for proto in tcp udp; do
+      comment="WG-GW-RANGE ${proto}:${PREFORWARD_RANGE}->${BACKEND_TUN_IP}"
+      iptables -t nat -C PREROUTING -i "$WAN_IF" -p "$proto" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j DNAT --to-destination "$BACKEND_TUN_IP" 2>/dev/null || need_repair "missing gateway ${proto} preforward DNAT rule"
+      iptables -C FORWARD -i "$WAN_IF" -o "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || need_repair "missing gateway ${proto} preforward FORWARD rule"
+    done
+  fi
+fi
+
+if ((repair_needed)); then
+  /usr/local/sbin/wg-gateway-apply
+fi
+EOF
+chmod +x "$CHECK_BIN"
 
 cat > "$REMOVE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -259,17 +304,20 @@ usage() {
   sudo wg-gw on
   sudo wg-gw off
   sudo wg-gw restart
+  sudo wg-gw repair
   sudo wg-gw status
   sudo wg-gw list
 USAGE
 }
 
 case "${1:-}" in
-  on|enable|start) systemctl enable --now wg-gateway.service ;;
-  off|disable|stop) systemctl disable --now wg-gateway.service ;;
-  restart) systemctl restart wg-gateway.service ;;
+  on|enable|start) systemctl enable --now wg-gateway.service wg-gateway-check.timer ;;
+  off|disable|stop) systemctl disable --now wg-gateway-check.timer wg-gateway.service ;;
+  restart) /usr/local/bin/wg-opt-restart ;;
+  repair|check) /usr/local/sbin/wg-gateway-check ;;
   status)
     systemctl is-active wg-gateway.service 2>/dev/null || true
+    systemctl is-active wg-gateway-check.timer 2>/dev/null || true
     wg show "$WG_NAME" 2>/dev/null || true
     ip route show "$GUEST_SUBNET" 2>/dev/null || true
     iptables -t nat -S PREROUTING | grep -E 'WG-GW|WG-GW-RANGE' || true
@@ -279,6 +327,16 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$HELPER_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart wg-gateway.service
+systemctl enable --now wg-gateway-check.timer >/dev/null
+systemctl start wg-gateway-check.service >/dev/null 2>&1 || true
+wg-gw status
+EOF
+chmod +x "$RESTART_BIN"
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -291,15 +349,45 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=${APPLY_BIN}
 ExecStop=${REMOVE_BIN}
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=WireGuard optimized gateway self-healing check
+After=network-online.target wg-gateway.service
+Wants=network-online.target wg-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<EOF
+[Unit]
+Description=Run WireGuard optimized gateway self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=wg-gateway-check.service
+
+[Install]
+WantedBy=timers.target
 EOF
 
 echo "==> 启动 WireGuard 网关"
 systemctl daemon-reload
 systemctl enable wg-gateway.service >/dev/null
 systemctl restart wg-gateway.service
+systemctl enable --now wg-gateway-check.timer >/dev/null
+systemctl start wg-gateway-check.service >/dev/null 2>&1 || true
 
 echo
 echo "============================================================"
@@ -318,6 +406,9 @@ echo "   网关公钥: ${GATEWAY_PUBLIC_KEY}"
 echo "------------------------------------------------------------"
 echo " 管理:"
 echo "   sudo wg-gw status"
+echo "   sudo wg-gw repair"
+echo "   sudo wg-gw restart"
 echo "   sudo wg-gw off"
 echo "   sudo wg-gw on"
+echo "   sudo wg-opt-restart"
 echo "============================================================"

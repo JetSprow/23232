@@ -258,33 +258,41 @@ sudo GATEWAY_PUBLIC_IP=优化节点公网IP GATEWAY_PORT=51820 GATEWAY_PUBLIC_KE
 
 ```bash
 sudo wg-gw status
+sudo wg-gw repair
+sudo wg-gw restart
 sudo wg-gw off
 sudo wg-gw on
+sudo wg-opt-restart
 ```
 
 普通 Incus 节点：
 
 ```bash
 sudo wg-be status
+sudo wg-be repair
+sudo wg-be restart
 sudo wg-be off
 sudo wg-be on
+sudo wg-opt-restart
 incus exec 实例名 -- sh -lc 'apk update || true; wget -O- https://api.ipify.org'
 ```
 
 WireGuard 模式默认预转发 `20000-30000` 的 TCP/UDP 到普通节点 WG IP，端口号保持不变。面板节点端口范围也应设置为 `20000-30000`，用户访问地址填优化线路节点公网 IP 或域名。
 
-脚本默认使用更保守的 WireGuard `MTU=1060` 和 TCP `MSS=1020`，避免部分家宽线路 TLS/HTTP2 卡住。如需手动指定：
+脚本使用 `wg-opt` 作为 WireGuard 接口名，并会安装自修复定时器。普通节点会持续检查 `2020` 路由表、`10.10.0.0/22` 小鸡网段策略路由、`10.255.10.2` 回程策略路由，以及预转发/放行规则；优化线路节点会持续检查到小鸡网段的路由、SNAT、DNAT、FORWARD 和 WireGuard 端口放行规则。规则丢失时会自动补回，不会在正常状态下反复断开 WireGuard。
+
+检查自修复定时器：
 
 ```bash
-sudo WG_MTU=1060 TCP_MSS=1020 bash setup-normal-vps.sh
-sudo WG_MTU=1060 TCP_MSS=1020 bash setup-home-vps.sh
+systemctl status wg-backend-check.timer --no-pager -l
+systemctl status wg-gateway-check.timer --no-pager -l
 ```
 
-如需启用自动探测：
+脚本默认使用 WireGuard `MTU=1180`。如需手动指定：
 
 ```bash
-sudo AUTO_MTU_PROBE=1 bash setup-normal-vps.sh
-sudo AUTO_MTU_PROBE=1 bash setup-home-vps.sh
+sudo WG_MTU=1180 bash setup-wg-backend.sh
+sudo WG_MTU=1180 bash setup-wg-gateway.sh
 ```
 
 诊断 GitHub Raw / Check.Place 卡住：
@@ -307,7 +315,8 @@ sudo bash diagnose-github-raw.sh 2>&1 | tee /tmp/github-raw-diagnose.log
 
 ```bash
 sudo wg show
-systemctl status wg-quick@wg0 --no-pager -l
+systemctl status wg-backend.service --no-pager -l
+systemctl status wg-gateway.service --no-pager -l
 ```
 
 查看出口 IP：
@@ -319,5 +328,6 @@ curl -4 https://ip.sb
 停止隧道：
 
 ```bash
-sudo wg-quick down wg0
+sudo wg-be off
+sudo wg-gw off
 ```

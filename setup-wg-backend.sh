@@ -12,8 +12,12 @@ STATE_DIR="/etc/wg-backend"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/wg-backend-apply"
 REMOVE_BIN="/usr/local/sbin/wg-backend-remove"
+CHECK_BIN="/usr/local/sbin/wg-backend-check"
 HELPER_BIN="/usr/local/bin/wg-be"
+RESTART_BIN="/usr/local/bin/wg-opt-restart"
 UNIT_FILE="/etc/systemd/system/wg-backend.service"
+CHECK_UNIT_FILE="/etc/systemd/system/wg-backend-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/wg-backend-check.timer"
 
 WG_NAME="${WG_NAME:-wg-opt}"
 WG_MTU="${WG_MTU:-1180}"
@@ -215,8 +219,9 @@ net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 SYSCTL
 
-wg-quick down "$WG_NAME" >/dev/null 2>&1 || true
-wg-quick up "$WG_NAME"
+if ! wg show "$WG_NAME" >/dev/null 2>&1; then
+  wg-quick up "$WG_NAME"
+fi
 
 ip route replace "$GUEST_SUBNET" dev "$INCUS_BRIDGE" table "$WG_TABLE"
 ip route replace default dev "$WG_NAME" table "$WG_TABLE"
@@ -247,6 +252,48 @@ if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
 fi
 EOF
 chmod +x "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-backend/config.env
+
+repair_needed=0
+
+need_repair() {
+  repair_needed=1
+  logger -t wg-backend-check "$*"
+}
+
+if ! wg show "$WG_NAME" >/dev/null 2>&1; then
+  need_repair "WireGuard interface ${WG_NAME} is missing"
+else
+  ip route show table "$WG_TABLE" | grep -Eq "^default dev ${WG_NAME}( |$)" || need_repair "missing policy default route in table ${WG_TABLE}"
+  ip route show table "$WG_TABLE" | grep -F "$GUEST_SUBNET" | grep -F "dev $INCUS_BRIDGE" >/dev/null || need_repair "missing guest subnet route in table ${WG_TABLE}"
+  ip rule show | grep -F "from $GUEST_SUBNET lookup $WG_TABLE" >/dev/null || need_repair "missing guest subnet ip rule"
+  ip rule show | grep -F "from $BACKEND_TUN_IP lookup $WG_TABLE" >/dev/null || need_repair "missing backend tunnel ip rule"
+
+  iptables -t mangle -C FORWARD -o "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing outbound TCPMSS rule"
+  iptables -t mangle -C FORWARD -i "$WG_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing inbound TCPMSS rule"
+  iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$WG_NAME" -j ACCEPT 2>/dev/null || need_repair "missing guest to WireGuard forward rule"
+  iptables -C FORWARD -i "$WG_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || need_repair "missing WireGuard to guest forward rule"
+  iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$WG_NAME" -j SNAT --to-source "$BACKEND_TUN_IP" 2>/dev/null || need_repair "missing backend SNAT rule"
+
+  if [[ "${PREFORWARD_ENABLE:-1}" == "1" ]]; then
+    for proto in tcp udp; do
+      comment="WG-BE-RANGE ${proto}:${PREFORWARD_RANGE}"
+      local_comment="WG-BE-LOCAL ${proto}:${PREFORWARD_RANGE}"
+      iptables -t nat -C PREROUTING -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$local_comment" -j REDIRECT 2>/dev/null || need_repair "missing local ${proto} preforward rule"
+      iptables -C INPUT -i "$WG_NAME" -p "$proto" -d "$BACKEND_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null || need_repair "missing ${proto} preforward input rule"
+    done
+  fi
+fi
+
+if ((repair_needed)); then
+  /usr/local/sbin/wg-backend-apply
+fi
+EOF
+chmod +x "$CHECK_BIN"
 
 cat > "$REMOVE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -284,16 +331,19 @@ usage() {
   sudo wg-be on
   sudo wg-be off
   sudo wg-be restart
+  sudo wg-be repair
   sudo wg-be status
 USAGE
 }
 
 case "${1:-}" in
-  on|enable|start) systemctl enable --now wg-backend.service ;;
-  off|disable|stop) systemctl disable --now wg-backend.service ;;
-  restart) systemctl restart wg-backend.service ;;
+  on|enable|start) systemctl enable --now wg-backend.service wg-backend-check.timer ;;
+  off|disable|stop) systemctl disable --now wg-backend-check.timer wg-backend.service ;;
+  restart) /usr/local/bin/wg-opt-restart ;;
+  repair|check) /usr/local/sbin/wg-backend-check ;;
   status)
     systemctl is-active wg-backend.service 2>/dev/null || true
+    systemctl is-active wg-backend-check.timer 2>/dev/null || true
     wg show "$WG_NAME" 2>/dev/null || true
     ip rule show | grep -F "lookup ${WG_TABLE}" || true
     ip route show table "$WG_TABLE" 2>/dev/null || true
@@ -302,6 +352,16 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$HELPER_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart wg-backend.service
+systemctl enable --now wg-backend-check.timer >/dev/null
+systemctl start wg-backend-check.service >/dev/null 2>&1 || true
+wg-be status
+EOF
+chmod +x "$RESTART_BIN"
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -314,15 +374,45 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=${APPLY_BIN}
 ExecStop=${REMOVE_BIN}
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=WireGuard optimized backend self-healing check
+After=network-online.target wg-backend.service
+Wants=network-online.target wg-backend.service
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<EOF
+[Unit]
+Description=Run WireGuard optimized backend self-healing check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=wg-backend-check.service
+
+[Install]
+WantedBy=timers.target
 EOF
 
 echo "==> 启动 WireGuard 后端"
 systemctl daemon-reload
 systemctl enable wg-backend.service >/dev/null
 systemctl restart wg-backend.service
+systemctl enable --now wg-backend-check.timer >/dev/null
+systemctl start wg-backend-check.service >/dev/null 2>&1 || true
 
 echo
 echo "============================================================"
@@ -337,8 +427,11 @@ echo " 预转发端口:   ${PREFORWARD_ENABLE} (${PREFORWARD_RANGE})"
 echo "------------------------------------------------------------"
 echo " 管理:"
 echo "   sudo wg-be status"
+echo "   sudo wg-be repair"
+echo "   sudo wg-be restart"
 echo "   sudo wg-be off"
 echo "   sudo wg-be on"
+echo "   sudo wg-opt-restart"
 echo " 测试:"
 echo "   ping -c 3 ${GATEWAY_TUN_IP}"
 echo "============================================================"
