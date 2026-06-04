@@ -20,6 +20,14 @@ WG_MTU="1060"
 TCP_MSS="1020"
 DNS_HELPER="/usr/local/sbin/wg-ipv4-dns"
 OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040 1020 1000 984"
+STATE_DIR="/etc/wg-normal"
+CONFIG_FILE="$STATE_DIR/config.env"
+APPLY_BIN="/usr/local/sbin/wg-normal-apply"
+CHECK_BIN="/usr/local/sbin/wg-normal-check"
+RESTART_BIN="/usr/local/bin/wg-normal-restart"
+HELPER_BIN="/usr/local/bin/wg-normal"
+CHECK_UNIT_FILE="/etc/systemd/system/wg-normal-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/wg-normal-check.timer"
 
 detect_outer_mtu() {
   local target="$1"
@@ -121,6 +129,8 @@ while ip -4 rule del table main suppress_prefixlength 0 priority 101 2>/dev/null
 while ip -4 rule del not fwmark "${WG_FWMARK}" table "${WG_TABLE}" priority 102 2>/dev/null; do :; done
 ip -4 route flush table "${WG_TABLE}" 2>/dev/null || true
 while iptables -t mangle -D OUTPUT -p tcp -m multiport --sports "${SSH_PORTS}" -j MARK --set-mark "${WG_FWMARK}" 2>/dev/null; do :; done
+while iptables -t mangle -D OUTPUT -p udp --dport 53 -j MARK --set-mark "${WG_FWMARK}" 2>/dev/null; do :; done
+while iptables -t mangle -D OUTPUT -p tcp --dport 53 -j MARK --set-mark "${WG_FWMARK}" 2>/dev/null; do :; done
 for old_mss in $OLD_MSS_VALUES; do
   while iptables -t mangle -D OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
   while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
@@ -235,6 +245,8 @@ Table = off
 FwMark = ${WG_FWMARK}
 MTU = ${WG_MTU}
 PostUp = iptables -t mangle -C OUTPUT -p tcp -m multiport --sports ${SSH_PORTS} -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp -m multiport --sports ${SSH_PORTS} -j MARK --set-mark ${WG_FWMARK}
+PostUp = iptables -t mangle -C OUTPUT -p udp --dport 53 -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport 53 -j MARK --set-mark ${WG_FWMARK}
+PostUp = iptables -t mangle -C OUTPUT -p tcp --dport 53 -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 53 -j MARK --set-mark ${WG_FWMARK}
 PostUp = iptables -t mangle -C OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS} 2>/dev/null || iptables -t mangle -A OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS}
 PostUp = iptables -t mangle -C FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS} 2>/dev/null || iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS}
 PostUp = iptables -t mangle -C PREROUTING -i ${WAN_IF} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${WG_FWMARK} 2>/dev/null || iptables -t mangle -A PREROUTING -i ${WAN_IF} -m conntrack --ctstate NEW -j CONNMARK --set-mark ${WG_FWMARK}
@@ -250,6 +262,8 @@ PostDown = ip -4 rule del not fwmark ${WG_FWMARK} table ${WG_TABLE} priority 102
 PostDown = ip -4 rule del table main suppress_prefixlength 0 priority 101 2>/dev/null || true
 PostDown = ip -4 rule del fwmark ${WG_FWMARK} table main priority 100 2>/dev/null || true
 PostDown = iptables -t mangle -D OUTPUT -p tcp -m multiport --sports ${SSH_PORTS} -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || true
+PostDown = iptables -t mangle -D OUTPUT -p udp --dport 53 -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || true
+PostDown = iptables -t mangle -D OUTPUT -p tcp --dport 53 -j MARK --set-mark ${WG_FWMARK} 2>/dev/null || true
 PostDown = iptables -t mangle -D OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS} 2>/dev/null || true
 PostDown = iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${TCP_MSS} 2>/dev/null || true
 PostDown = iptables -t mangle -D OUTPUT -m mark --mark 0x0 -m connmark --mark ${WG_FWMARK} -j CONNMARK --restore-mark 2>/dev/null || true
@@ -265,9 +279,233 @@ PersistentKeepalive = 25
 EOF
 chmod 600 /etc/wireguard/wg0.conf
 
+mkdir -p "$STATE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+WG_SERVER_IP=${WG_SERVER_IP}
+WG_CLIENT_IP=${WG_CLIENT_IP}
+HOME_ENDPOINT=${HOME_ENDPOINT}
+HOME_ENDPOINT_IPV4=${HOME_ENDPOINT_IPV4}
+HOME_PORT=${HOME_PORT}
+SERVER_PUB=${SERVER_PUB}
+DNS_VIA_TUNNEL=${DNS_VIA_TUNNEL}
+WG_TABLE=${WG_TABLE}
+WG_FWMARK=${WG_FWMARK}
+WG_MTU=${WG_MTU}
+TCP_MSS=${TCP_MSS}
+WAN_IF=${WAN_IF}
+SSH_PORTS=${SSH_PORTS}
+EOF
+chmod 600 "$CONFIG_FILE"
+
+echo "==> 写入自修复脚本与 systemd 定时器"
+cat > "$APPLY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-normal/config.env
+
+resolve_endpoint() {
+  local endpoint="$1"
+  if [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$endpoint"
+    return 0
+  fi
+  local ns added_rules=() result
+  while read -r ns; do
+    [[ "$ns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    if ip -4 rule add to "${ns}/32" table main priority 99 2>/dev/null; then
+      added_rules+=("$ns")
+    fi
+  done < <(awk '/^nameserver[[:space:]]+[0-9.]+/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n 3)
+  result="$(getent ahostsv4 "$endpoint" | awk '{print $1; exit}' || true)"
+  for ns in "${added_rules[@]}"; do
+    ip -4 rule del to "${ns}/32" table main priority 99 2>/dev/null || true
+  done
+  printf '%s\n' "$result"
+}
+
+update_config_value() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" 'BEGIN{done=0} index($0,key"=")==1{print key"="value; done=1; next} {print} END{if(!done) print key"="value}' /etc/wg-normal/config.env > "$tmp"
+  cat "$tmp" > /etc/wg-normal/config.env
+  rm -f "$tmp"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+
+new_endpoint="$(resolve_endpoint "$HOME_ENDPOINT" || true)"
+if [[ -n "$new_endpoint" && "$new_endpoint" != "$HOME_ENDPOINT_IPV4" ]]; then
+  logger -t wg-normal-apply "home endpoint changed: ${HOME_ENDPOINT_IPV4} -> ${new_endpoint}"
+  sed -i "s#^Endpoint = .*#Endpoint = ${new_endpoint}:${HOME_PORT}#" /etc/wireguard/wg0.conf
+  HOME_ENDPOINT_IPV4="$new_endpoint"
+  update_config_value HOME_ENDPOINT_IPV4 "$HOME_ENDPOINT_IPV4"
+fi
+update_config_value WAN_IF "$WAN_IF"
+
+sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+
+if ! wg show wg0 >/dev/null 2>&1; then
+  systemctl restart wg-quick@wg0
+fi
+
+wg set wg0 peer "$SERVER_PUB" endpoint "${HOME_ENDPOINT_IPV4}:${HOME_PORT}" persistent-keepalive 25 >/dev/null 2>&1 || true
+
+iptables -t mangle -C OUTPUT -p tcp -m multiport --sports "$SSH_PORTS" -j MARK --set-mark "$WG_FWMARK" 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp -m multiport --sports "$SSH_PORTS" -j MARK --set-mark "$WG_FWMARK"
+iptables -t mangle -C OUTPUT -p udp --dport 53 -j MARK --set-mark "$WG_FWMARK" 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport 53 -j MARK --set-mark "$WG_FWMARK"
+iptables -t mangle -C OUTPUT -p tcp --dport 53 -j MARK --set-mark "$WG_FWMARK" 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 53 -j MARK --set-mark "$WG_FWMARK"
+iptables -t mangle -C OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A OUTPUT -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+iptables -t mangle -C FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS" 2>/dev/null || iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+iptables -t mangle -C PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark "$WG_FWMARK" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark "$WG_FWMARK"
+iptables -t mangle -C PREROUTING -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
+iptables -t mangle -C OUTPUT -m mark --mark 0x0 -m connmark --mark "$WG_FWMARK" -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A OUTPUT -m mark --mark 0x0 -m connmark --mark "$WG_FWMARK" -j CONNMARK --restore-mark
+
+ip -4 rule add fwmark "$WG_FWMARK" table main priority 100 2>/dev/null || true
+ip -4 rule add table main suppress_prefixlength 0 priority 101 2>/dev/null || true
+ip -4 rule add not fwmark "$WG_FWMARK" table "$WG_TABLE" priority 102 2>/dev/null || true
+ip -4 route replace default dev wg0 table "$WG_TABLE"
+ip -4 route flush cache 2>/dev/null || true
+EOF
+chmod 755 "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-normal/config.env
+
+repair=0
+restart=0
+
+resolve_endpoint() {
+  local endpoint="$1"
+  if [[ "$endpoint" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$endpoint"
+    return 0
+  fi
+  local ns added_rules=() result
+  while read -r ns; do
+    [[ "$ns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    if ip -4 rule add to "${ns}/32" table main priority 99 2>/dev/null; then
+      added_rules+=("$ns")
+    fi
+  done < <(awk '/^nameserver[[:space:]]+[0-9.]+/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n 3)
+  result="$(getent ahostsv4 "$endpoint" | awk '{print $1; exit}' || true)"
+  for ns in "${added_rules[@]}"; do
+    ip -4 rule del to "${ns}/32" table main priority 99 2>/dev/null || true
+  done
+  printf '%s\n' "$result"
+}
+
+need_repair() {
+  repair=1
+  logger -t wg-normal-check "$*"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+if [[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]]; then
+  need_repair "default interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+fi
+
+resolved="$(resolve_endpoint "$HOME_ENDPOINT" || true)"
+if [[ -n "$resolved" && "$resolved" != "$HOME_ENDPOINT_IPV4" ]]; then
+  restart=1
+  need_repair "home endpoint A record changed: ${HOME_ENDPOINT_IPV4} -> ${resolved}"
+fi
+
+if ! wg show wg0 >/dev/null 2>&1; then
+  restart=1
+  need_repair "wg0 is not running"
+else
+  now="$(date +%s)"
+  latest="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2; exit}')"
+  if [[ -z "$latest" || "$latest" == "0" ]]; then
+    restart=1
+    need_repair "WireGuard has no handshake"
+  elif (( now - latest > 180 )); then
+    restart=1
+    need_repair "WireGuard handshake is stale: $((now - latest))s"
+  fi
+fi
+
+ip -4 route show table "$WG_TABLE" | grep -q '^default dev wg0' || need_repair "missing wg table default route"
+ip -4 rule show | grep -F "not from all fwmark 0x$(printf '%x' "$WG_FWMARK") lookup $WG_TABLE" >/dev/null || ip -4 rule show | grep -F "not from all fwmark $WG_FWMARK lookup $WG_TABLE" >/dev/null || need_repair "missing wg policy rule"
+iptables -t mangle -C OUTPUT -p tcp -m multiport --sports "$SSH_PORTS" -j MARK --set-mark "$WG_FWMARK" 2>/dev/null || need_repair "missing SSH keepalive mark rule"
+iptables -t mangle -C OUTPUT -p udp --dport 53 -j MARK --set-mark "$WG_FWMARK" 2>/dev/null || need_repair "missing DNS keepalive mark rule"
+
+if (( restart )); then
+  systemctl restart wg-quick@wg0 || true
+fi
+if (( repair )); then
+  /usr/local/sbin/wg-normal-apply
+fi
+EOF
+chmod 755 "$CHECK_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart wg-quick@wg0
+/usr/local/sbin/wg-normal-apply
+wg show wg0 || true
+systemctl status wg-quick@wg0 wg-normal-check.timer --no-pager --lines=8
+EOF
+chmod 755 "$RESTART_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-normal/config.env
+case "${1:-status}" in
+  status) wg show wg0 || true; ip -4 rule show; ip -4 route show table "$WG_TABLE"; systemctl status wg-quick@wg0 wg-normal-check.timer --no-pager --lines=8 ;;
+  check) /usr/local/sbin/wg-normal-check ;;
+  apply) /usr/local/sbin/wg-normal-apply ;;
+  restart) /usr/local/bin/wg-normal-restart ;;
+  logs) journalctl -u wg-quick@wg0 -u wg-normal-check.service --no-pager "${@:2}" ;;
+  *) echo "usage: wg-normal status|check|apply|restart|logs" >&2; exit 2 ;;
+esac
+EOF
+chmod 755 "$HELPER_BIN"
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=WireGuard normal VPS self-heal check
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run WireGuard normal VPS self-heal check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+mkdir -p /etc/systemd/system/wg-quick@wg0.service.d
+cat > /etc/systemd/system/wg-quick@wg0.service.d/10-incusse-normal-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+
 echo "==> 启动 WireGuard"
+systemctl daemon-reload
 systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
 systemctl restart wg-quick@wg0
+systemctl enable --now wg-normal-check.timer >/dev/null 2>&1 || true
 
 sleep 2
 echo
@@ -291,8 +529,9 @@ echo " 出口端点:    ${HOME_ENDPOINT_IPV4}:${HOME_PORT}"
 echo " SSH 保留:    TCP 源端口 ${SSH_PORTS} 走原公网出口"
 echo " MTU/MSS:     MTU ${WG_MTU}, TCP MSS ${TCP_MSS}"
 echo " IPv6:        已禁用，不配置 IPv6 隧道路由"
+echo " 自修复:      wg-normal-check.timer 每 30 秒检查 endpoint/握手/路由/规则"
 echo "============================================================"
-echo " 失联兜底: 配置前先 (crontab -e) 加一行 5 分钟自动断开:"
-echo "   */5 * * * * wg-quick down wg0"
-echo " 测试稳定后再删掉这行."
+echo " 一键重启:    wg-normal-restart"
+echo " 排查:        wg-normal status | wg-normal logs -n 80"
+echo " 提醒:        家宽动态 IP 建议填 DDNS 域名；填固定 IP 时无法自动发现新 IP。"
 echo "============================================================"

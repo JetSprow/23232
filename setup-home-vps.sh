@@ -19,6 +19,14 @@ WG_MTU="1060"
 TCP_MSS="1020"
 MTU_PROBE_TARGETS="${MTU_PROBE_TARGETS:-185.199.108.133 1.1.1.1 8.8.8.8}"
 OLD_MSS_VALUES="1240 1200 1160 1140 1120 1100 1080 1040 1020 1000 984"
+STATE_DIR="/etc/wg-home"
+CONFIG_FILE="$STATE_DIR/config.env"
+APPLY_BIN="/usr/local/sbin/wg-home-apply"
+CHECK_BIN="/usr/local/sbin/wg-home-check"
+RESTART_BIN="/usr/local/bin/wg-home-restart"
+HELPER_BIN="/usr/local/bin/wg-home"
+CHECK_UNIT_FILE="/etc/systemd/system/wg-home-check.service"
+CHECK_TIMER_FILE="/etc/systemd/system/wg-home-check.timer"
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 [[ -n "$WAN_IF" ]] || { echo "无法识别默认网卡"; exit 1; }
 
@@ -205,6 +213,7 @@ for old_mss in $OLD_MSS_VALUES; do
   while iptables -t mangle -D FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$old_mss" 2>/dev/null; do :; done
 done
 while iptables -t nat -D POSTROUTING -o "${WAN_IF}" -j MASQUERADE 2>/dev/null; do :; done
+while iptables -t nat -D POSTROUTING -s "${WG_NET}" ! -d "${WG_NET}" -j MASQUERADE 2>/dev/null; do :; done
 
 echo "==> 设置 WireGuard MTU/MSS"
 set_mtu_mss
@@ -246,6 +255,18 @@ PublicKey = ${CLIENT_PUB}
 AllowedIPs = ${WG_CLIENT_IP}/32
 EOF
 chmod 600 /etc/wireguard/wg0.conf
+
+mkdir -p "$STATE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+WG_PORT=${WG_PORT}
+WG_NET=${WG_NET}
+WG_SERVER_IP=${WG_SERVER_IP}
+WG_CLIENT_IP=${WG_CLIENT_IP}
+WG_MTU=${WG_MTU}
+TCP_MSS=${TCP_MSS}
+WAN_IF=${WAN_IF}
+EOF
+chmod 600 "$CONFIG_FILE"
 
 echo "==> 保持系统 DNS，只让 dnsmasq 监听 wg0"
 if systemctl is-active --quiet systemd-resolved; then
@@ -294,6 +315,168 @@ add_rule FORWARD -p udp --dport 853 -j DROP
 add_nat PREROUTING -i wg0 -p udp --dport 53 -j DNAT --to-destination ${WG_SERVER_IP}:53
 add_nat PREROUTING -i wg0 -p tcp --dport 53 -j DNAT --to-destination ${WG_SERVER_IP}:53
 
+echo "==> 写入自修复脚本与 systemd 定时器"
+cat > "$APPLY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-home/config.env
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+[[ -n "$current_wan" ]] && WAN_IF="$current_wan"
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+
+if ! wg show wg0 >/dev/null 2>&1; then
+  systemctl restart wg-quick@wg0
+fi
+
+systemctl restart dnsmasq >/dev/null 2>&1 || true
+
+add_rule() { iptables -C "$@" 2>/dev/null || iptables -I "$@"; }
+add_nat()  { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -I "$@"; }
+add_mangle_append() { iptables -t mangle -C "$@" 2>/dev/null || iptables -t mangle -A "$@"; }
+add_forward_append() { iptables -C "$@" 2>/dev/null || iptables -A "$@"; }
+add_nat_append() { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"; }
+
+add_rule INPUT -i wg0 -p udp --dport 53 -j ACCEPT
+add_rule INPUT -i wg0 -p tcp --dport 53 -j ACCEPT
+add_mangle_append FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+add_mangle_append FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$TCP_MSS"
+add_forward_append FORWARD -i wg0 -j ACCEPT
+add_forward_append FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+add_nat_append POSTROUTING -s "$WG_NET" ! -d "$WG_NET" -j MASQUERADE
+
+for s in "BitTorrent protocol" "BitTorrent" "peer_id=" "announce.php?passkey=" \
+         "info_hash" "get_peers" "announce_peer" "find_node"; do
+  add_rule FORWARD -m string --algo bm --string "$s" -j DROP
+done
+add_rule FORWARD -p tcp --dport 6881:6889 -j DROP
+add_rule FORWARD -p udp --dport 6881:6889 -j DROP
+add_rule FORWARD -p udp --dport 1337 -j DROP
+add_rule FORWARD -p tcp --dport 853 -j DROP
+add_rule FORWARD -p udp --dport 853 -j DROP
+add_nat PREROUTING -i wg0 -p udp --dport 53 -j DNAT --to-destination "${WG_SERVER_IP}:53"
+add_nat PREROUTING -i wg0 -p tcp --dport 53 -j DNAT --to-destination "${WG_SERVER_IP}:53"
+
+tmp="$(mktemp)"
+awk -v wan="$WAN_IF" 'BEGIN{done=0} /^WAN_IF=/{print "WAN_IF=" wan; done=1; next} {print} END{if(!done) print "WAN_IF=" wan}' /etc/wg-home/config.env > "$tmp"
+cat "$tmp" > /etc/wg-home/config.env
+rm -f "$tmp"
+EOF
+chmod 755 "$APPLY_BIN"
+
+cat > "$CHECK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-home/config.env
+
+repair=0
+restart_needed=0
+reason=()
+
+need_repair() {
+  repair=1
+  reason+=("$*")
+  logger -t wg-home-check "$*"
+}
+
+current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
+if [[ -n "$current_wan" && "$current_wan" != "${WAN_IF:-}" ]]; then
+  restart_needed=1
+  need_repair "default interface changed: ${WAN_IF:-unknown} -> ${current_wan}"
+fi
+
+public_ip="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4 -fsS --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+if [[ -n "$public_ip" ]]; then
+  last_file="/var/lib/wg-home-last-public-ip"
+  last_ip="$(cat "$last_file" 2>/dev/null || true)"
+  if [[ -n "$last_ip" && "$last_ip" != "$public_ip" ]]; then
+    restart_needed=1
+    need_repair "public IPv4 changed: ${last_ip} -> ${public_ip}"
+  fi
+  mkdir -p /var/lib
+  printf '%s\n' "$public_ip" > "$last_file"
+fi
+
+wg show wg0 >/dev/null 2>&1 || need_repair "wg0 is not running"
+systemctl is-active --quiet dnsmasq || need_repair "dnsmasq is not running"
+iptables -t nat -C POSTROUTING -s "$WG_NET" ! -d "$WG_NET" -j MASQUERADE 2>/dev/null || need_repair "missing NAT MASQUERADE rule"
+iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || need_repair "missing wg0 forward rule"
+iptables -t nat -C PREROUTING -i wg0 -p udp --dport 53 -j DNAT --to-destination "${WG_SERVER_IP}:53" 2>/dev/null || need_repair "missing UDP DNS redirect"
+
+if (( restart_needed )); then
+  systemctl restart wg-quick@wg0 || true
+  systemctl restart dnsmasq || true
+fi
+if (( repair )); then
+  /usr/local/sbin/wg-home-apply
+fi
+EOF
+chmod 755 "$CHECK_BIN"
+
+cat > "$RESTART_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl restart wg-quick@wg0
+systemctl restart dnsmasq || true
+/usr/local/sbin/wg-home-apply
+systemctl status wg-quick@wg0 dnsmasq --no-pager --lines=8
+EOF
+chmod 755 "$RESTART_BIN"
+
+cat > "$HELPER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-status}" in
+  status) wg show wg0 || true; systemctl status wg-quick@wg0 dnsmasq wg-home-check.timer --no-pager --lines=8 ;;
+  check) /usr/local/sbin/wg-home-check ;;
+  apply) /usr/local/sbin/wg-home-apply ;;
+  restart) /usr/local/bin/wg-home-restart ;;
+  logs) journalctl -u wg-quick@wg0 -u dnsmasq -u wg-home-check.service --no-pager "${@:2}" ;;
+  *) echo "usage: wg-home status|check|apply|restart|logs" >&2; exit 2 ;;
+esac
+EOF
+chmod 755 "$HELPER_BIN"
+
+cat > "$CHECK_UNIT_FILE" <<EOF
+[Unit]
+Description=WireGuard home exit self-heal check
+After=network-online.target wg-quick@wg0.service dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CHECK_BIN}
+EOF
+
+cat > "$CHECK_TIMER_FILE" <<'EOF'
+[Unit]
+Description=Run WireGuard home exit self-heal check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+mkdir -p /etc/systemd/system/wg-quick@wg0.service.d
+cat > /etc/systemd/system/wg-quick@wg0.service.d/10-incusse-home-restart.conf <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wg-home-check.timer >/dev/null 2>&1 || true
+
 echo "==> 持久化 iptables"
 netfilter-persistent save >/dev/null
 
@@ -306,6 +489,8 @@ echo " 监听端口:    UDP ${WG_PORT}  (路由器/防火墙记得放行+端口�
 echo " 隧道网段:    10.0.0.0/24"
 echo " 客户端 IP:   ${WG_CLIENT_IP}"
 echo " MTU/MSS:     MTU ${WG_MTU}, TCP MSS ${TCP_MSS}"
+echo " 自修复:      wg-home-check.timer 每 30 秒检查 IP/接口/规则"
 echo "============================================================"
-echo " 排查: wg show | journalctl -u wg-quick@wg0 | journalctl -u dnsmasq"
+echo " 一键重启:    wg-home-restart"
+echo " 排查:        wg-home status | wg-home logs -n 80"
 echo "============================================================"
