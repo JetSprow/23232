@@ -31,6 +31,23 @@ git pull --ff-only
 chmod +x *.sh
 ```
 
+## 交互式一键安装器
+
+不想手动选择单个脚本时，直接运行交互式安装器：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/install.sh -o install.sh
+sudo bash install.sh
+```
+
+安装器会先安装基础工具 `bash`、`curl`、`ca-certificates`、`git`、`sudo`，然后把脚本同步到 `/opt/23232`，再通过菜单选择家宽出口、SOCKS5/SS、GRE 优化线路、WireGuard 优化线路和 HTTPS 诊断等功能。
+
+如需指定本地脚本目录：
+
+```bash
+sudo INSTALL_DIR=/root/23232 bash install.sh
+```
+
 ## 一键执行
 
 家宽 VPS 出口端：
