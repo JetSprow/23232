@@ -174,9 +174,14 @@ sudo wg-home logs -n 80
 ```bash
 sudo wg-normal status
 sudo wg-normal check
+sudo wg-normal recover
+sudo wg-normal fallback
 sudo wg-normal restart
+sudo wg-normal stop
 sudo wg-normal logs -n 80
 ```
+
+普通 WireGuard 客户端会优先使用家宽出口；如果家宽端 WireGuard 握手失效、动态 IP 未恢复、或真实 IPv4 出口测试不通，会自动撤销策略路由并回落到普通 VPS 本机原出口，避免整机断网。回落后 `wg-normal-check.timer` 每 5 分钟尝试一次家宽出口，恢复成功后再切回。
 
 家宽 SOCKS5 / Shadowsocks：
 
@@ -195,9 +200,13 @@ sudo home-ss logs -n 80
 ```bash
 sudo zck status
 sudo zck repair
+sudo zck recover
+sudo zck fallback
 sudo zck restart
 sudo zck diag
 ```
+
+普通机器 SOCKS5 / Shadowsocks 代理出口同样带回落保护：上游代理出口不通时会停掉 sing-box/TUN 并恢复本机原出口，但保留自修复定时器；之后每 5 分钟自动尝试恢复代理出口。
 
 GRE / WireGuard 优化线路：
 
@@ -225,6 +234,62 @@ sudo wg-be restart
 
 ```bash
 systemctl list-timers '*check.timer' --no-pager
+```
+
+## 紧急停止方法
+
+这些命令用于先恢复机器可访问性。普通侧脚本会尽量回落到本机原出口；服务端脚本会停止对应服务和自修复定时器。
+
+家宽 WireGuard 服务端：
+
+```bash
+sudo systemctl disable --now wg-home-check.timer wg-quick@wg0 dnsmasq
+sudo iptables -t nat -D POSTROUTING -s 10.0.0.0/24 ! -d 10.0.0.0/24 -j MASQUERADE 2>/dev/null || true
+```
+
+普通 WireGuard 客户端：
+
+```bash
+sudo wg-normal stop
+```
+
+普通机器 SOCKS5 / Shadowsocks 代理出口：
+
+```bash
+sudo zck off
+```
+
+家宽 SOCKS5 服务端：
+
+```bash
+sudo systemctl disable --now home-socks5-check.timer danted home-socks5-mss.service
+```
+
+家宽 Shadowsocks 服务端：
+
+```bash
+sudo systemctl disable --now home-ss-check.timer home-ss.service
+```
+
+GRE 优化线路：
+
+```bash
+sudo gre-be off
+sudo gre-gw off
+```
+
+WireGuard 优化线路：
+
+```bash
+sudo wg-be off
+sudo wg-gw off
+```
+
+如果 helper 命令不存在，可以直接停对应定时器和服务：
+
+```bash
+sudo systemctl disable --now '*check.timer'
+sudo systemctl stop wg-quick@wg0 sing-box egress-bypass 2>/dev/null || true
 ```
 
 ## GRE 优化线路模式

@@ -24,10 +24,13 @@ STATE_DIR="/etc/wg-normal"
 CONFIG_FILE="$STATE_DIR/config.env"
 APPLY_BIN="/usr/local/sbin/wg-normal-apply"
 CHECK_BIN="/usr/local/sbin/wg-normal-check"
+FALLBACK_BIN="/usr/local/sbin/wg-normal-fallback"
+RECOVER_BIN="/usr/local/sbin/wg-normal-recover"
 RESTART_BIN="/usr/local/bin/wg-normal-restart"
 HELPER_BIN="/usr/local/bin/wg-normal"
 CHECK_UNIT_FILE="/etc/systemd/system/wg-normal-check.service"
 CHECK_TIMER_FILE="/etc/systemd/system/wg-normal-check.timer"
+MODE_FILE="$STATE_DIR/mode"
 
 detect_outer_mtu() {
   local target="$1"
@@ -294,8 +297,11 @@ WG_MTU=${WG_MTU}
 TCP_MSS=${TCP_MSS}
 WAN_IF=${WAN_IF}
 SSH_PORTS=${SSH_PORTS}
+MODE_FILE=${MODE_FILE}
 EOF
 chmod 600 "$CONFIG_FILE"
+printf 'home\n' > "$MODE_FILE"
+chmod 600 "$MODE_FILE"
 
 echo "==> 写入自修复脚本与 systemd 定时器"
 cat > "$APPLY_BIN" <<'EOF'
@@ -371,6 +377,67 @@ ip -4 route flush cache 2>/dev/null || true
 EOF
 chmod 755 "$APPLY_BIN"
 
+cat > "$FALLBACK_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-normal/config.env
+
+reason="${1:-home egress unavailable}"
+logger -t wg-normal-fallback "fallback to local egress: ${reason}"
+
+ip -4 route flush table "$WG_TABLE" 2>/dev/null || true
+ip -4 rule del not fwmark "$WG_FWMARK" table "$WG_TABLE" priority 102 2>/dev/null || true
+ip -4 rule del table main suppress_prefixlength 0 priority 101 2>/dev/null || true
+ip -4 rule del fwmark "$WG_FWMARK" table main priority 100 2>/dev/null || true
+ip -4 route flush cache 2>/dev/null || true
+
+mkdir -p "$(dirname "$MODE_FILE")"
+printf 'local\n' > "$MODE_FILE"
+chmod 600 "$MODE_FILE"
+EOF
+chmod 755 "$FALLBACK_BIN"
+
+cat > "$RECOVER_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/wg-normal/config.env
+
+logger -t wg-normal-recover "attempting home egress recovery"
+
+/usr/local/sbin/wg-normal-apply || {
+  /usr/local/sbin/wg-normal-fallback "apply failed during recovery"
+  exit 1
+}
+
+sleep 3
+
+latest="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2; exit}' || true)"
+now="$(date +%s)"
+if [[ -z "$latest" || "$latest" == "0" || $((now - latest)) -gt 180 ]]; then
+  /usr/local/sbin/wg-normal-fallback "WireGuard handshake unavailable after recovery"
+  exit 1
+fi
+
+ok=0
+for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
+    ok=1
+    break
+  fi
+done
+
+if (( ok )); then
+  printf 'home\n' > "$MODE_FILE"
+  chmod 600 "$MODE_FILE"
+  logger -t wg-normal-recover "home egress recovered"
+  exit 0
+fi
+
+/usr/local/sbin/wg-normal-fallback "IPv4 egress test failed after recovery"
+exit 1
+EOF
+chmod 755 "$RECOVER_BIN"
+
 cat > "$CHECK_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -378,6 +445,14 @@ source /etc/wg-normal/config.env
 
 repair=0
 restart=0
+mode="$(cat "$MODE_FILE" 2>/dev/null || echo home)"
+if [[ "$mode" == "local" ]]; then
+  if /usr/local/sbin/wg-normal-recover; then
+    exit 0
+  fi
+  logger -t wg-normal-check "home egress still unavailable; keeping local egress until next 5 minute check"
+  exit 0
+fi
 
 resolve_endpoint() {
   local endpoint="$1"
@@ -439,7 +514,21 @@ if (( restart )); then
   systemctl restart wg-quick@wg0 || true
 fi
 if (( repair )); then
-  /usr/local/sbin/wg-normal-apply
+  if ! /usr/local/sbin/wg-normal-recover; then
+    exit 0
+  fi
+fi
+
+egress_ok=0
+for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
+    egress_ok=1
+    break
+  fi
+done
+if (( ! egress_ok )); then
+  /usr/local/sbin/wg-normal-fallback "home IPv4 egress test failed"
+  exit 0
 fi
 EOF
 chmod 755 "$CHECK_BIN"
@@ -448,7 +537,7 @@ cat > "$RESTART_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 systemctl restart wg-quick@wg0
-/usr/local/sbin/wg-normal-apply
+/usr/local/sbin/wg-normal-recover
 wg show wg0 || true
 systemctl status wg-quick@wg0 wg-normal-check.timer --no-pager --lines=8
 EOF
@@ -459,12 +548,16 @@ cat > "$HELPER_BIN" <<'EOF'
 set -euo pipefail
 source /etc/wg-normal/config.env
 case "${1:-status}" in
-  status) wg show wg0 || true; ip -4 rule show; ip -4 route show table "$WG_TABLE"; systemctl status wg-quick@wg0 wg-normal-check.timer --no-pager --lines=8 ;;
+  status) echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo home)"; wg show wg0 || true; ip -4 rule show; ip -4 route show table "$WG_TABLE"; systemctl status wg-quick@wg0 wg-normal-check.timer --no-pager --lines=8 ;;
   check) /usr/local/sbin/wg-normal-check ;;
   apply) /usr/local/sbin/wg-normal-apply ;;
+  fallback) /usr/local/sbin/wg-normal-fallback "manual fallback" ;;
+  recover) /usr/local/sbin/wg-normal-recover ;;
   restart) /usr/local/bin/wg-normal-restart ;;
+  stop|off) systemctl disable --now wg-normal-check.timer >/dev/null 2>&1 || true; /usr/local/sbin/wg-normal-fallback "manual stop"; systemctl stop wg-quick@wg0 >/dev/null 2>&1 || true; echo "已停止家宽出口策略路由和 wg0，当前使用本机原出口。" ;;
+  start|on) systemctl enable --now wg-normal-check.timer >/dev/null 2>&1 || true; /usr/local/sbin/wg-normal-recover ;;
   logs) journalctl -u wg-quick@wg0 -u wg-normal-check.service --no-pager "${@:2}" ;;
-  *) echo "usage: wg-normal status|check|apply|restart|logs" >&2; exit 2 ;;
+  *) echo "usage: wg-normal status|check|apply|fallback|recover|restart|stop|start|logs" >&2; exit 2 ;;
 esac
 EOF
 chmod 755 "$HELPER_BIN"
@@ -485,9 +578,9 @@ cat > "$CHECK_TIMER_FILE" <<'EOF'
 Description=Run WireGuard normal VPS self-heal check
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
-AccuracySec=5s
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=20s
 Persistent=true
 
 [Install]
@@ -514,9 +607,12 @@ NEW_IP="$(curl -4 -s --max-time 8 ifconfig.me | tr -d '\r\n' || echo '获取失�
 echo "    当前出口 IP: $NEW_IP"
 echo "    原公网 IP:   $PUB_IP"
 if [[ "$NEW_IP" == "$PUB_IP" || "$NEW_IP" == "获取失败" ]]; then
-  echo "    [!] 出口未切换或 DNS/转发未通，检查: wg show / 家宽端口 / 家宽端 NAT"
+  echo "    [!] 家宽出口暂不可用，已回落本机原出口；自修复会每 5 分钟尝试恢复家宽出口。"
+  /usr/local/sbin/wg-normal-fallback "initial IPv4 egress test failed" || true
 else
   echo "    [OK] IPv4 流量已走家宽出口"
+  printf 'home\n' > "$MODE_FILE"
+  chmod 600 "$MODE_FILE"
 fi
 
 echo
@@ -529,9 +625,10 @@ echo " 出口端点:    ${HOME_ENDPOINT_IPV4}:${HOME_PORT}"
 echo " SSH 保留:    TCP 源端口 ${SSH_PORTS} 走原公网出口"
 echo " MTU/MSS:     MTU ${WG_MTU}, TCP MSS ${TCP_MSS}"
 echo " IPv6:        已禁用，不配置 IPv6 隧道路由"
-echo " 自修复:      wg-normal-check.timer 每 30 秒检查 endpoint/握手/路由/规则"
+echo " 自修复:      wg-normal-check.timer 每 5 分钟检查；家宽不通自动回落本机出口"
 echo "============================================================"
 echo " 一键重启:    wg-normal-restart"
+echo " 紧急停止:    sudo wg-normal stop"
 echo " 排查:        wg-normal status | wg-normal logs -n 80"
 echo " 提醒:        家宽动态 IP 建议填 DDNS 域名；填固定 IP 时无法自动发现新 IP。"
 echo "============================================================"

@@ -98,6 +98,7 @@ BYPASS_UNIT="/etc/systemd/system/egress-bypass.service"
 CHECK_BIN="/usr/local/sbin/egress-socks-check"
 CHECK_UNIT="/etc/systemd/system/egress-socks-check.service"
 CHECK_TIMER="/etc/systemd/system/egress-socks-check.timer"
+MODE_FILE="$STATE_DIR/mode"
 ROLLBACK_SENTINEL="/run/egress-socks-start-ok"
 ROLLBACK_SCRIPT="/run/egress-socks-rollback.sh"
 
@@ -732,6 +733,7 @@ CONFIG_FILE="/etc/sing-box/config.json"
 BYPASS_MARK="0x42"
 PROXY_LIST_FILE="/etc/egress-socks/proxies.json"
 ACTIVE_PROXY_FILE="/etc/egress-socks/active_proxy"
+MODE_FILE="/etc/egress-socks/mode"
 
 TUN_NAME="$(python3 - 2>/dev/null <<'PY' || echo egress-tun0
 import json
@@ -757,6 +759,8 @@ usage() {
   check     校验 sing-box 配置
   restart   重启 sing-box（保留 bypass）
   repair    自修复检查并补齐 sing-box / bypass / TUN
+  fallback  回落本机原出口，但保留定时器后续自动尝试恢复
+  recover   立即尝试恢复到家宽 SOCKS/SS 出口
   off       停掉 sing-box、egress-bypass 与自修复，恢复直连
   on        重新启用 sing-box、egress-bypass 与自修复
 USAGE
@@ -1131,6 +1135,7 @@ cmd_proxy() {
 
 cmd_status() {
   local unit
+  echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo proxy)"
   for unit in egress-bypass sing-box; do
     if systemctl is-active --quiet "$unit"; then
       echo "$unit: active"
@@ -1244,10 +1249,37 @@ cmd_repair() {
   /usr/local/sbin/egress-socks-check
   cmd_status
 }
-cmd_off() {
-  systemctl disable --now egress-socks-check.timer >/dev/null 2>&1 || true
+cmd_fallback() {
+  local reason="${1:-manual fallback}"
+  logger -t zck "fallback to local egress: ${reason}"
   systemctl disable --now sing-box                 >/dev/null 2>&1 || true
   systemctl disable --now egress-bypass            >/dev/null 2>&1 || true
+  ip link delete "$TUN_NAME" >/dev/null 2>&1 || true
+  nft delete table inet egress-bypass >/dev/null 2>&1 || true
+  ip -4 rule del fwmark "$BYPASS_MARK" lookup main pref 8000 >/dev/null 2>&1 || true
+  ip -6 rule del fwmark "$BYPASS_MARK" lookup main pref 8000 >/dev/null 2>&1 || true
+  mkdir -p "$(dirname "$MODE_FILE")"
+  printf 'local\n' > "$MODE_FILE"
+  chmod 600 "$MODE_FILE"
+  echo "已回落本机原出口。自修复定时器会继续尝试恢复家宽 SOCKS/SS 出口。"
+}
+cmd_recover() {
+  sing-box check -c "$CONFIG_FILE"
+  systemctl enable --now egress-bypass >/dev/null 2>&1 || true
+  systemctl enable --now sing-box >/dev/null 2>&1 || true
+  sleep 2
+  if curl_egress_ip >/dev/null; then
+    printf 'proxy\n' > "$MODE_FILE"
+    chmod 600 "$MODE_FILE"
+    echo "家宽 SOCKS/SS 出口已恢复。"
+    return 0
+  fi
+  cmd_fallback "recover test failed"
+  return 1
+}
+cmd_off() {
+  systemctl disable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  cmd_fallback "manual off" >/dev/null || true
   echo "已关闭。流量恢复原始直连。"
 }
 cmd_on() {
@@ -1255,6 +1287,8 @@ cmd_on() {
   systemctl enable --now sing-box                 >/dev/null 2>&1 || true
   systemctl enable --now egress-socks-check.timer >/dev/null 2>&1 || true
   systemctl start egress-socks-check.service      >/dev/null 2>&1 || true
+  printf 'proxy\n' > "$MODE_FILE"
+  chmod 600 "$MODE_FILE"
   cmd_status
 }
 
@@ -1267,6 +1301,8 @@ case "${1:-status}" in
   check)   cmd_check   ;;
   restart) cmd_restart ;;
   repair)  cmd_repair  ;;
+  fallback) cmd_fallback ;;
+  recover) cmd_recover ;;
   off)     cmd_off     ;;
   on)      cmd_on      ;;
   -h|--help|help) usage ;;
@@ -1282,6 +1318,7 @@ install_self_heal() {
 set -euo pipefail
 
 CONFIG_FILE="/etc/sing-box/config.json"
+MODE_FILE="/etc/egress-socks/mode"
 TUN_NAME="$(python3 - 2>/dev/null <<'PY' || echo egress-tun0
 import json
 try:
@@ -1300,6 +1337,16 @@ PY
 
 repair=0
 restart_singbox=0
+mode="$(cat "$MODE_FILE" 2>/dev/null || echo proxy)"
+
+if [[ "$mode" == "local" ]]; then
+  if /usr/local/bin/zck recover >/dev/null 2>&1; then
+    logger -t egress-socks-check "proxy egress recovered"
+  else
+    logger -t egress-socks-check "proxy egress still unavailable; keeping local egress"
+  fi
+  exit 0
+fi
 
 need_repair() {
   repair=1
@@ -1330,6 +1377,18 @@ fi
 if (( restart_singbox )); then
   systemctl restart sing-box.service || true
 fi
+
+egress_ok=0
+for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
+  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
+    egress_ok=1
+    break
+  fi
+done
+if (( ! egress_ok )); then
+  /usr/local/bin/zck fallback "proxy IPv4 egress test failed" >/dev/null 2>&1 || true
+  exit 0
+fi
 EOF
   chmod 755 "$CHECK_BIN"
 
@@ -1349,9 +1408,9 @@ EOF
 Description=Run Egress SOCKS self-healing check
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=60s
-AccuracySec=10s
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=20s
 Persistent=true
 Unit=egress-socks-check.service
 
@@ -1421,6 +1480,7 @@ SYSCTL
   sleep 2
 
   local ok=1
+  local fallback_mode=0
   echo
   if systemctl --quiet is-active egress-bypass; then
     echo "  [OK]   egress-bypass 服务已启用"
@@ -1461,15 +1521,24 @@ SYSCTL
   fi
   if [[ -n "$egress_ip" ]]; then
     echo "  [OK]   真实出口测试通过: $egress_ip"
+    printf 'proxy\n' > "$MODE_FILE"
+    chmod 600 "$MODE_FILE"
   else
-    echo "  [FAIL] 真实出口测试失败；90 秒回滚保险不会解除"
-    ok=0
+    echo "  [WARN] 真实出口测试失败；立即回落本机原出口，自修复会每 5 分钟尝试恢复家宽 SOCKS/SS。"
+    /usr/local/bin/zck fallback "initial proxy IPv4 egress test failed" >/dev/null 2>&1 || true
+    printf 'local\n' > "$MODE_FILE"
+    chmod 600 "$MODE_FILE"
+    fallback_mode=1
   fi
 
   echo
   if (( ok )); then
     touch "$ROLLBACK_SENTINEL"
-    echo "全部就绪。验证出口 IP：sudo zck test"
+    if (( fallback_mode )); then
+      echo "已安全回落本机原出口。自修复保留开启，会每 5 分钟尝试恢复家宽 SOCKS/SS 出口。"
+    else
+      echo "全部就绪。验证出口 IP：sudo zck test"
+    fi
     echo "管理上游出口：sudo zck proxy list | add socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口 | switch"
     echo "若 IPv4 出口 IP 等于节点真实 IP，请运行 sudo zck diag 查看上游连通性。"
   else
