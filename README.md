@@ -60,6 +60,12 @@ curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-vps.
 sudo bash setup-home-vps.sh
 ```
 
+只允许普通机器访问家宽 WireGuard 入口：
+
+```bash
+sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' bash setup-home-vps.sh
+```
+
 普通 VPS 客户端：
 
 ```bash
@@ -72,6 +78,12 @@ sudo bash setup-normal-vps.sh
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-socks5.sh -o setup-home-socks5.sh
 sudo bash setup-home-socks5.sh
+```
+
+只允许普通机器访问家宽 SOCKS5 入口：
+
+```bash
+sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' bash setup-home-socks5.sh
 ```
 
 家宽入口 IP 白名单防护：
@@ -90,6 +102,8 @@ sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' LOCKDOWN_ALL=1 bash
 ```
 
 `LOCKDOWN_ALL=1` 会让所有入站只接受白名单 IP 和已建立连接，使用前务必确认当前 SSH 来源已经在白名单内。
+
+`setup-home-vps.sh`、`setup-home-socks5.sh`、`setup-home-ss.sh` 已内置调用该白名单脚本。传入 `ALLOW_IPS` 时会自动保护对应服务入口端口：WireGuard 保护 `${WG_PORT}/udp`，SOCKS5 保护 `${SOCKS_PORT}/tcp`，Shadowsocks 保护 `${SS_PORT}/tcp`。默认不会锁 SSH；需要全入口锁定时再额外传 `LOCKDOWN_ALL=1`。
 
 管理：
 
@@ -124,6 +138,12 @@ sudo BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' bash setup-egre
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-ss.sh -o setup-home-ss.sh
 sudo SS_HOST=你的入口IP或域名 SS_PORT=端口 bash setup-home-ss.sh
+```
+
+只允许普通机器访问家宽 Shadowsocks 入口：
+
+```bash
+sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' SS_HOST=你的入口IP或域名 SS_PORT=端口 bash setup-home-ss.sh
 ```
 
 普通机器接入该 SS：

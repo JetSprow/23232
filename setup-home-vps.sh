@@ -3,11 +3,18 @@
 # 功能: WireGuard 服务端 + dnsmasq 黑名单 + BT/PT/金融过滤 + IPv4-only 出口
 # 用法: sudo bash setup-home-vps.sh
 # 可选: WG_PORT=443 sudo bash setup-home-vps.sh
+# 可选: ALLOW_IPS=普通机器公网IP sudo bash setup-home-vps.sh
 set -euo pipefail
 trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
 
 [[ $EUID -eq 0 ]] || { echo "需要 root 权限 (sudo)"; exit 1; }
 command -v apt-get >/dev/null || { echo "仅支持 Debian/Ubuntu"; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/JetSprow/23232/main}"
+HOME_ALLOW_IPS="${HOME_ALLOW_IPS:-${ALLOW_IPS:-}}"
+HOME_FIREWALL_LOCKDOWN="${HOME_FIREWALL_LOCKDOWN:-${LOCKDOWN_ALL:-0}}"
+HOME_FIREWALL_SKIP="${HOME_FIREWALL_SKIP:-0}"
 
 WG_PORT="${WG_PORT:-}"
 WG_NET="10.0.0.0/24"
@@ -29,6 +36,33 @@ CHECK_UNIT_FILE="/etc/systemd/system/wg-home-check.service"
 CHECK_TIMER_FILE="/etc/systemd/system/wg-home-check.timer"
 WAN_IF="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 [[ -n "$WAN_IF" ]] || { echo "无法识别默认网卡"; exit 1; }
+
+setup_home_firewall_whitelist() {
+  local ports="$1" script_path tmp_script
+  if [[ "$HOME_FIREWALL_SKIP" == "1" ]]; then
+    echo "    [!] 已选择跳过家宽入口白名单防护。"
+    return 0
+  fi
+  if [[ -z "$HOME_ALLOW_IPS" && -t 0 ]]; then
+    echo
+    echo "建议开启家宽入口 IP 白名单，只允许普通机器访问 WireGuard 入口。"
+    read -rp "普通机器公网 IPv4 白名单，多个用逗号分隔 [留空跳过]: " HOME_ALLOW_IPS
+  fi
+  if [[ -z "$HOME_ALLOW_IPS" ]]; then
+    echo "    [!] 未配置 ALLOW_IPS，跳过家宽入口白名单防护。"
+    echo "        建议重新运行: sudo ALLOW_IPS=普通机器公网IP bash setup-home-vps.sh"
+    return 0
+  fi
+  script_path="${SCRIPT_DIR}/setup-home-firewall-whitelist.sh"
+  if [[ -f "$script_path" ]]; then
+    ALLOW_IPS="$HOME_ALLOW_IPS" PROTECT_PORTS="$ports" LOCKDOWN_ALL="$HOME_FIREWALL_LOCKDOWN" bash "$script_path"
+    return
+  fi
+  tmp_script="$(mktemp)"
+  curl -fsSL "${RAW_BASE}/setup-home-firewall-whitelist.sh" -o "$tmp_script"
+  ALLOW_IPS="$HOME_ALLOW_IPS" PROTECT_PORTS="$ports" LOCKDOWN_ALL="$HOME_FIREWALL_LOCKDOWN" bash "$tmp_script"
+  rm -f "$tmp_script"
+}
 
 detect_outer_mtu() {
   local target payload
@@ -476,6 +510,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now wg-home-check.timer >/dev/null 2>&1 || true
+setup_home_firewall_whitelist "${WG_PORT}/udp"
 
 echo "==> 持久化 iptables"
 netfilter-persistent save >/dev/null

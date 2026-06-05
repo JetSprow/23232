@@ -158,14 +158,18 @@ EOF
 }
 
 install_home_wg() {
-  local port mtu mss
+  local port mtu mss allow lockdown
   port="$(ask "WireGuard 监听端口" "51820")"
   valid_port "$port" || { echo "端口无效"; return 1; }
   mtu="$(ask "WG_MTU，留空用默认" "")"
   mss="$(ask "TCP_MSS，留空用默认" "")"
+  allow="$(ask "普通机器公网 IPv4 白名单，多个用逗号分隔，留空跳过" "")"
+  lockdown="$(ask "是否锁定所有入站，只允许白名单 IP 1/0；默认只保护 WireGuard 端口" "0")"
   local envs=("WG_PORT=${port}")
   [[ -n "$mtu" ]] && envs+=("WG_MTU=${mtu}")
   [[ -n "$mss" ]] && envs+=("TCP_MSS=${mss}")
+  [[ -n "$allow" ]] && envs+=("ALLOW_IPS=${allow}" "LOCKDOWN_ALL=${lockdown}")
+  [[ -z "$allow" ]] && envs+=("HOME_FIREWALL_SKIP=1")
   run_script setup-home-vps.sh "${envs[@]}"
 }
 
@@ -180,30 +184,38 @@ install_normal_wg() {
 }
 
 install_home_socks5() {
-  local host port user pass mss
+  local host port user pass mss allow lockdown
   host="$(ask "对外入口 IP/域名，留空自动检测" "")"
   port="$(ask "SOCKS5 监听端口" "6013")"
   valid_port "$port" || { echo "端口无效"; return 1; }
   user="$(ask "用户名，留空自动生成" "")"
   pass="$(ask_secret "密码，留空自动生成")"
   mss="$(ask "SOCKS_TCP_MSS" "1200")"
+  allow="$(ask "普通机器公网 IPv4 白名单，多个用逗号分隔，留空跳过" "")"
+  lockdown="$(ask "是否锁定所有入站，只允许白名单 IP 1/0；默认只保护 SOCKS5 端口" "0")"
   local envs=("SOCKS_PORT=${port}" "SOCKS_TCP_MSS=${mss}")
   [[ -n "$host" ]] && envs+=("SOCKS_HOST=${host}")
   [[ -n "$user" ]] && envs+=("SOCKS_USER=${user}")
   [[ -n "$pass" ]] && envs+=("SOCKS_PASS=${pass}")
+  [[ -n "$allow" ]] && envs+=("ALLOW_IPS=${allow}" "LOCKDOWN_ALL=${lockdown}")
+  [[ -z "$allow" ]] && envs+=("HOME_FIREWALL_SKIP=1")
   run_script setup-home-socks5.sh "${envs[@]}"
 }
 
 install_home_ss() {
-  local host port method pass
+  local host port method pass allow lockdown
   host="$(ask "对外入口 IP/域名，留空自动检测" "")"
   port="$(ask "Shadowsocks 监听端口" "6013")"
   valid_port "$port" || { echo "端口无效"; return 1; }
   method="$(ask "加密方法" "aes-256-gcm")"
   pass="$(ask_secret "密码，留空自动生成")"
+  allow="$(ask "普通机器公网 IPv4 白名单，多个用逗号分隔，留空跳过" "")"
+  lockdown="$(ask "是否锁定所有入站，只允许白名单 IP 1/0；默认只保护 Shadowsocks 端口" "0")"
   local envs=("SS_PORT=${port}" "SS_METHOD=${method}")
   [[ -n "$host" ]] && envs+=("SS_HOST=${host}")
   [[ -n "$pass" ]] && envs+=("SS_PASSWORD=${pass}")
+  [[ -n "$allow" ]] && envs+=("ALLOW_IPS=${allow}" "LOCKDOWN_ALL=${lockdown}")
+  [[ -z "$allow" ]] && envs+=("HOME_FIREWALL_SKIP=1")
   run_script setup-home-ss.sh "${envs[@]}"
 }
 

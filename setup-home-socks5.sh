@@ -7,11 +7,18 @@
 #   sudo SOCKS_HOST=home.example.com SOCKS_PORT=6013 bash setup-home-socks5.sh
 #   sudo SOCKS_PORT=6013 SOCKS_USER=myuser SOCKS_PASS=mypass bash setup-home-socks5.sh
 #   sudo SOCKS_TCP_MSS=1200 bash setup-home-socks5.sh
+#   sudo ALLOW_IPS=普通机器公网IP bash setup-home-socks5.sh
 set -euo pipefail
 trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
 
 [[ $EUID -eq 0 ]] || { echo "需要 root 权限 (sudo)"; exit 1; }
 command -v apt-get >/dev/null || { echo "仅支持 Debian/Ubuntu"; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/JetSprow/23232/main}"
+HOME_ALLOW_IPS="${HOME_ALLOW_IPS:-${ALLOW_IPS:-}}"
+HOME_FIREWALL_LOCKDOWN="${HOME_FIREWALL_LOCKDOWN:-${LOCKDOWN_ALL:-0}}"
+HOME_FIREWALL_SKIP="${HOME_FIREWALL_SKIP:-0}"
 
 valid_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
@@ -23,6 +30,33 @@ valid_user() {
 
 gen_hex() {
   openssl rand -hex "$1"
+}
+
+setup_home_firewall_whitelist() {
+  local ports="$1" script_path tmp_script
+  if [[ "$HOME_FIREWALL_SKIP" == "1" ]]; then
+    echo "    [!] 已选择跳过家宽入口白名单防护。"
+    return 0
+  fi
+  if [[ -z "$HOME_ALLOW_IPS" && -t 0 ]]; then
+    echo
+    echo "建议开启家宽入口 IP 白名单，只允许普通机器访问 SOCKS5 入口。"
+    read -rp "普通机器公网 IPv4 白名单，多个用逗号分隔 [留空跳过]: " HOME_ALLOW_IPS
+  fi
+  if [[ -z "$HOME_ALLOW_IPS" ]]; then
+    echo "    [!] 未配置 ALLOW_IPS，跳过家宽入口白名单防护。"
+    echo "        建议重新运行: sudo ALLOW_IPS=普通机器公网IP bash setup-home-socks5.sh"
+    return 0
+  fi
+  script_path="${SCRIPT_DIR}/setup-home-firewall-whitelist.sh"
+  if [[ -f "$script_path" ]]; then
+    ALLOW_IPS="$HOME_ALLOW_IPS" PROTECT_PORTS="$ports" LOCKDOWN_ALL="$HOME_FIREWALL_LOCKDOWN" bash "$script_path"
+    return
+  fi
+  tmp_script="$(mktemp)"
+  curl -fsSL "${RAW_BASE}/setup-home-firewall-whitelist.sh" -o "$tmp_script"
+  ALLOW_IPS="$HOME_ALLOW_IPS" PROTECT_PORTS="$ports" LOCKDOWN_ALL="$HOME_FIREWALL_LOCKDOWN" bash "$tmp_script"
+  rm -f "$tmp_script"
 }
 
 SOCKS_PORT="${SOCKS_PORT:-}"
@@ -306,6 +340,7 @@ RestartSec=5s
 EOF
 systemctl daemon-reload
 systemctl enable --now home-socks5-check.timer >/dev/null 2>&1 || true
+setup_home_firewall_whitelist "${SOCKS_PORT}/tcp"
 
 echo "==> 本机连通性测试"
 if curl -4 -fsS --connect-timeout 8 --max-time 20 --proxy "socks5h://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" https://ip.sb >/tmp/home-socks5-test.out 2>/tmp/home-socks5-test.err; then
