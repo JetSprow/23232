@@ -11,6 +11,8 @@
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
 - `setup-wg-gateway.sh`：优化线路节点 WireGuard 网关，替代 GRE，适合 GRE 导致 HTTPS/TLS 卡住的线路。
 - `setup-wg-backend.sh`：普通 Incus 节点 WireGuard 后端，让小鸡通过 WG 走优化线路网关。
+- `setup-ab-entry.sh`：三机 AB 隧道 A 入口机，用户访问 A，流量经 A-B WireGuard 隧道进入 B。
+- `setup-ab-relay.sh`：三机 AB 隧道 B 中继机，把 A 隧道来的端口流量转发到 C 小鸡所在机器同端口。
 - `diagnose-github-raw.sh`：诊断 `raw.githubusercontent.com`、`Check.Place` 等 HTTPS 连接卡住的问题。
 
 脚本默认面向 Debian/Ubuntu，需要 root 权限执行。
@@ -285,6 +287,13 @@ sudo wg-be off
 sudo wg-gw off
 ```
 
+三机 AB 隧道：
+
+```bash
+sudo ab-entry off
+sudo ab-relay off
+```
+
 如果 helper 命令不存在，可以直接停对应定时器和服务：
 
 ```bash
@@ -458,6 +467,85 @@ sudo WG_MTU=1180 bash setup-wg-gateway.sh
 curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/diagnose-github-raw.sh -o diagnose-github-raw.sh
 sudo bash diagnose-github-raw.sh 2>&1 | tee /tmp/github-raw-diagnose.log
 ```
+
+## 三机 AB 隧道入口模式
+
+适合你现在这种三台机器：
+
+```text
+用户 -> A 入口机公网IP:20000-30000
+      -> A-B WireGuard 隧道
+      -> B 中继机
+      -> C 小鸡所在机器:同端口
+      -> C 面板原有端口映射 -> 小鸡
+```
+
+C 不需要安装新脚本，继续作为面板节点使用。面板连接 Incus 仍填 C 的 `https://C公网IP:8443`；用户访问地址/节点展示地址填 A 的公网 IP 或域名。端口范围保持 `20000-30000`。
+
+1. 在 A 入口机先生成 A 公钥：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-ab-entry.sh -o setup-ab-entry.sh
+sudo bash setup-ab-entry.sh
+```
+
+复制输出的 A 公钥。
+
+2. 在 B 中继机运行，并填 A 地址、A 公钥、C 地址：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-ab-relay.sh -o setup-ab-relay.sh
+sudo A_ENDPOINT=A公网IP或域名 A_PUBLIC_KEY='A公钥' C_TARGET=C公网IP或域名 bash setup-ab-relay.sh
+```
+
+复制输出的 B 公钥。
+
+3. 回到 A 入口机完成接入：
+
+```bash
+sudo B_PUBLIC_KEY='B公钥' bash setup-ab-entry.sh
+```
+
+完成后用户访问：
+
+```text
+A公网IP:23122
+```
+
+实际路径：
+
+```text
+用户 -> A:23122 -> B:23122 -> C:23122 -> 小鸡:22
+```
+
+脚本默认预转发 TCP/UDP `20000-30000`，端口号保持不变。C 上的面板/Incus 端口映射仍负责 `C:端口 -> 小鸡:端口`。
+
+管理命令：
+
+```bash
+sudo ab-entry status
+sudo ab-entry repair
+sudo ab-entry restart
+sudo ab-entry off
+sudo ab-entry on
+
+sudo ab-relay status
+sudo ab-relay repair
+sudo ab-relay restart
+sudo ab-relay off
+sudo ab-relay on
+```
+
+排查：
+
+```bash
+sudo ab-entry logs -n 80
+sudo ab-relay logs -n 80
+sudo ab-entry list
+sudo ab-relay list
+```
+
+注意：这个模式只改变用户入口路径，不改变小鸡主动访问外网的出口。小鸡外网出口仍由 C 决定。
 
 ## 使用顺序
 

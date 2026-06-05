@@ -78,7 +78,8 @@ ensure_repo() {
       for f in \
         setup-home-vps.sh setup-normal-vps.sh setup-home-socks5.sh setup-home-ss.sh \
         setup-egress-socks.sh setup-gre-gateway.sh setup-gre-backend.sh \
-        setup-wg-gateway.sh setup-wg-backend.sh diagnose-github-raw.sh; do
+        setup-wg-gateway.sh setup-wg-backend.sh setup-ab-entry.sh setup-ab-relay.sh \
+        diagnose-github-raw.sh; do
         curl -fsSL "${RAW_BASE}/${f}" | as_root tee "${INSTALL_DIR}/${f}" >/dev/null
       done
     fi
@@ -146,8 +147,10 @@ menu() {
   7. GRE 优化线路普通节点端
   8. WireGuard 优化线路网关端
   9. WireGuard 优化线路普通节点端
- 10. GitHub Raw / HTTPS 卡住诊断
- 11. 更新本地脚本
+ 10. 三机 AB 隧道 A 入口机
+ 11. 三机 AB 隧道 B 中继机
+ 12. GitHub Raw / HTTPS 卡住诊断
+ 13. 更新本地脚本
   0. 退出
 EOF
 }
@@ -274,6 +277,34 @@ install_wg_backend() {
   run_script setup-wg-backend.sh "${envs[@]}"
 }
 
+install_ab_entry() {
+  local port b_key range mtu
+  port="$(ask "A WireGuard 监听端口" "51821")"
+  valid_port "$port" || { echo "端口无效"; return 1; }
+  b_key="$(ask "B 中继机 WireGuard 公钥，留空只生成 A 公钥" "")"
+  range="$(ask "用户入口端口范围" "20000:30000")"
+  mtu="$(ask "WG_MTU" "1280")"
+  local envs=("WG_PORT=${port}" "PREFORWARD_RANGE=${range}" "WG_MTU=${mtu}")
+  [[ -n "$b_key" ]] && envs+=("B_PUBLIC_KEY=${b_key}")
+  run_script setup-ab-entry.sh "${envs[@]}"
+}
+
+install_ab_relay() {
+  local port a_endpoint a_key c_target range mtu
+  port="$(ask "A WireGuard 监听端口" "51821")"
+  valid_port "$port" || { echo "端口无效"; return 1; }
+  a_endpoint="$(ask "A 入口机公网 IPv4/域名，留空只生成 B 公钥" "")"
+  a_key="$(ask "A 入口机 WireGuard 公钥，留空只生成 B 公钥" "")"
+  c_target="$(ask "C 小鸡所在机器公网 IPv4/域名" "")"
+  range="$(ask "用户入口端口范围" "20000:30000")"
+  mtu="$(ask "WG_MTU" "1280")"
+  local envs=("WG_PORT=${port}" "PREFORWARD_RANGE=${range}" "WG_MTU=${mtu}")
+  [[ -n "$a_endpoint" ]] && envs+=("A_ENDPOINT=${a_endpoint}")
+  [[ -n "$a_key" ]] && envs+=("A_PUBLIC_KEY=${a_key}")
+  [[ -n "$c_target" ]] && envs+=("C_TARGET=${c_target}")
+  run_script setup-ab-relay.sh "${envs[@]}"
+}
+
 run_diagnose() {
   run_script diagnose-github-raw.sh
 }
@@ -299,8 +330,10 @@ main() {
       7) install_gre_backend; pause ;;
       8) install_wg_gateway; pause ;;
       9) install_wg_backend; pause ;;
-      10) run_diagnose; pause ;;
-      11) ensure_repo; echo "已更新 ${INSTALL_DIR}"; pause ;;
+      10) install_ab_entry; pause ;;
+      11) install_ab_relay; pause ;;
+      12) run_diagnose; pause ;;
+      13) ensure_repo; echo "已更新 ${INSTALL_DIR}"; pause ;;
       0) exit 0 ;;
       *) echo "无效序号"; pause ;;
     esac
