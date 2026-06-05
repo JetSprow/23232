@@ -6,6 +6,7 @@
 - `setup-normal-vps.sh`：普通 VPS 客户端，将 IPv4 出口切到家宽 VPS，并保留 SSH 连接。
 - `setup-home-socks5.sh`：家宽 VPS SOCKS5 服务端，创建账号密码并输出可复制的 SOCKS5 地址。
 - `setup-home-ss.sh`：家宽 VPS Shadowsocks 服务端，适合 SOCKS5 被线路 reset 时使用。
+- `setup-home-firewall-whitelist.sh`：家宽入口 IP 白名单防护，只允许普通机器 IP 访问家宽入口端口，其他来源 DROP。
 - `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5 或 Shadowsocks。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
@@ -71,6 +72,32 @@ sudo bash setup-normal-vps.sh
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-socks5.sh -o setup-home-socks5.sh
 sudo bash setup-home-socks5.sh
+```
+
+家宽入口 IP 白名单防护：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-firewall-whitelist.sh -o setup-home-firewall-whitelist.sh
+sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' PROTECT_PORTS='51820/udp,6013/tcp,6013/udp' bash setup-home-firewall-whitelist.sh
+```
+
+只允许白名单 IP 访问这些入口端口，其他来源直接 DROP。默认不修改 SSH，也不改全局默认策略，避免误锁机器。
+
+如果确认管理入口也只会从普通机器访问，可以开启全入口锁定：
+
+```bash
+sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' LOCKDOWN_ALL=1 bash setup-home-firewall-whitelist.sh
+```
+
+`LOCKDOWN_ALL=1` 会让所有入站只接受白名单 IP 和已建立连接，使用前务必确认当前 SSH 来源已经在白名单内。
+
+管理：
+
+```bash
+sudo home-fw status
+sudo home-fw add 新普通机器公网IP
+sudo home-fw remove 旧普通机器公网IP
+sudo home-fw off
 ```
 
 如果家宽机器的“出口 IP”和普通机器能连到的“入口 IP/域名”不一致，必须指定入口地址：
@@ -271,6 +298,12 @@ sudo systemctl disable --now home-socks5-check.timer danted home-socks5-mss.serv
 
 ```bash
 sudo systemctl disable --now home-ss-check.timer home-ss.service
+```
+
+家宽入口 IP 白名单防护：
+
+```bash
+sudo home-fw off
 ```
 
 GRE 优化线路：

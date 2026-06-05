@@ -77,6 +77,7 @@ ensure_repo() {
       local f
       for f in \
         setup-home-vps.sh setup-normal-vps.sh setup-home-socks5.sh setup-home-ss.sh \
+        setup-home-firewall-whitelist.sh \
         setup-egress-socks.sh setup-gre-gateway.sh setup-gre-backend.sh \
         setup-wg-gateway.sh setup-wg-backend.sh setup-ab-entry.sh setup-ab-relay.sh \
         diagnose-github-raw.sh; do
@@ -146,11 +147,12 @@ menu() {
   6. GRE 优化线路网关端
   7. GRE 优化线路普通节点端
   8. WireGuard 优化线路网关端
-  9. WireGuard 优化线路普通节点端
- 10. 三机 AB 隧道 A 入口机
- 11. 三机 AB 隧道 B 中继机
- 12. GitHub Raw / HTTPS 卡住诊断
- 13. 更新本地脚本
+ 9. WireGuard 优化线路普通节点端
+10. 三机 AB 隧道 A 入口机
+11. 三机 AB 隧道 B 中继机
+ 12. 家宽入口 IP 白名单防护
+ 13. GitHub Raw / HTTPS 卡住诊断
+ 14. 更新本地脚本
   0. 退出
 EOF
 }
@@ -305,6 +307,15 @@ install_ab_relay() {
   run_script setup-ab-relay.sh "${envs[@]}"
 }
 
+install_home_firewall_whitelist() {
+  local ips ports lockdown
+  ips="$(ask "普通机器公网 IPv4 白名单，多个用逗号分隔" "")"
+  [[ -n "$ips" ]] || { echo "白名单不能为空"; return 1; }
+  ports="$(ask "保护端口 proto，多个逗号分隔" "51820/udp,6013/tcp,6013/udp")"
+  lockdown="$(ask "是否锁定所有入站，只允许白名单 IP 1/0；默认只保护上述端口" "0")"
+  run_script setup-home-firewall-whitelist.sh "ALLOW_IPS=${ips}" "PROTECT_PORTS=${ports}" "LOCKDOWN_ALL=${lockdown}"
+}
+
 run_diagnose() {
   run_script diagnose-github-raw.sh
 }
@@ -332,8 +343,9 @@ main() {
       9) install_wg_backend; pause ;;
       10) install_ab_entry; pause ;;
       11) install_ab_relay; pause ;;
-      12) run_diagnose; pause ;;
-      13) ensure_repo; echo "已更新 ${INSTALL_DIR}"; pause ;;
+      12) install_home_firewall_whitelist; pause ;;
+      13) run_diagnose; pause ;;
+      14) ensure_repo; echo "已更新 ${INSTALL_DIR}"; pause ;;
       0) exit 0 ;;
       *) echo "无效序号"; pause ;;
     esac
