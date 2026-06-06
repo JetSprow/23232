@@ -71,6 +71,10 @@ PORT_RANGE_LOW="${PORT_RANGE_LOW:-20000}"
 PORT_RANGE_HIGH="${PORT_RANGE_HIGH:-30000}"
 BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-1.1.1.1}"
 TUN_IPV6="${TUN_IPV6:-0}"
+EGRESS_PROBE_URL="${EGRESS_PROBE_URL:-https://ip.sb}"
+EGRESS_CONNECT_TIMEOUT="${EGRESS_CONNECT_TIMEOUT:-12}"
+EGRESS_MAX_TIME="${EGRESS_MAX_TIME:-35}"
+EGRESS_RETRIES="${EGRESS_RETRIES:-2}"
 
 # -----------------------------------------------------------------------------
 # Internals — generally don't need editing.
@@ -370,17 +374,14 @@ PY
 }
 
 test_active_proxy_direct() {
-  local proxy_url out url
+  local proxy_url out
   if [[ "${ACTIVE_PROXY_TYPE:-socks5}" != "socks5" ]]; then
     echo "  上游 SS 将由 sing-box 校验并连接，跳过 curl SOCKS5 测试。"
     return 0
   fi
   proxy_url="$(active_proxy_url)"
-  for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
-    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS --proxy "$proxy_url" "$url" 2>/dev/null || true)"
-    [[ -n "$out" ]] && break
-  done
-  if [[ -z "$out" ]]; then
+  out="$(curl -4 --connect-timeout "$EGRESS_CONNECT_TIMEOUT" --max-time "$EGRESS_MAX_TIME" --retry "$EGRESS_RETRIES" --retry-delay 2 -fsS --proxy "$proxy_url" "$EGRESS_PROBE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ ! "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "  [WARN] 上游 SOCKS5 出口 IP 测试失败，可能是测速站被重置/拦截。" >&2
     echo "         将继续生成配置；如需测试失败就退出，请加 STRICT_PROXY_TEST=1。" >&2
     if [[ "${STRICT_PROXY_TEST:-0}" == "1" ]]; then
@@ -393,15 +394,10 @@ test_active_proxy_direct() {
 }
 
 curl_egress_ip() {
-  local out url
-  for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
-    out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" 2>/dev/null || true)"
-    if [[ -n "$out" ]]; then
-      echo "$out"
-      return 0
-    fi
-  done
-  return 1
+  local out
+  out="$(curl -4 --connect-timeout "$EGRESS_CONNECT_TIMEOUT" --max-time "$EGRESS_MAX_TIME" --retry "$EGRESS_RETRIES" --retry-delay 2 -fsS "$EGRESS_PROBE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  echo "$out"
 }
 
 load_active_proxy() {
@@ -734,6 +730,10 @@ BYPASS_MARK="0x42"
 PROXY_LIST_FILE="/etc/egress-socks/proxies.json"
 ACTIVE_PROXY_FILE="/etc/egress-socks/active_proxy"
 MODE_FILE="/etc/egress-socks/mode"
+EGRESS_PROBE_URL="${EGRESS_PROBE_URL:-https://ip.sb}"
+EGRESS_CONNECT_TIMEOUT="${EGRESS_CONNECT_TIMEOUT:-12}"
+EGRESS_MAX_TIME="${EGRESS_MAX_TIME:-35}"
+EGRESS_RETRIES="${EGRESS_RETRIES:-2}"
 
 TUN_NAME="$(python3 - 2>/dev/null <<'PY' || echo egress-tun0
 import json
@@ -747,6 +747,13 @@ except Exception:
     print("egress-tun0")
 PY
 )"
+
+curl_egress_ip() {
+  local out
+  out="$(curl -4 --connect-timeout "$EGRESS_CONNECT_TIMEOUT" --max-time "$EGRESS_MAX_TIME" --retry "$EGRESS_RETRIES" --retry-delay 2 -fsS "$EGRESS_PROBE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  echo "$out"
+}
 
 usage() {
   cat <<USAGE
@@ -1172,7 +1179,7 @@ cmd_test() {
       echo "== 小鸡 ($guest) =="
       printf 'IPv4 出口 IP   : '
       gout=$(incus exec "$guest" -- bash -lc \
-              'for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do out="$(curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" 2>/dev/null || true)"; [ -n "$out" ] && { echo "$out"; exit 0; }; done; exit 1' 2>/dev/null || true)
+              'out="$(curl -4 --connect-timeout 12 --max-time 35 --retry 2 --retry-delay 2 -fsS https://ip.sb 2>/dev/null | tr -d "[:space:]" || true)"; echo "$out" | grep -Eq "^([0-9]{1,3}\.){3}[0-9]{1,3}$" && echo "$out"' 2>/dev/null || true)
       if [[ -z "$gout" ]]; then
         echo "失败"
       else
@@ -1319,6 +1326,10 @@ set -euo pipefail
 
 CONFIG_FILE="/etc/sing-box/config.json"
 MODE_FILE="/etc/egress-socks/mode"
+EGRESS_PROBE_URL="${EGRESS_PROBE_URL:-https://ip.sb}"
+EGRESS_CONNECT_TIMEOUT="${EGRESS_CONNECT_TIMEOUT:-12}"
+EGRESS_MAX_TIME="${EGRESS_MAX_TIME:-35}"
+EGRESS_RETRIES="${EGRESS_RETRIES:-2}"
 TUN_NAME="$(python3 - 2>/dev/null <<'PY' || echo egress-tun0
 import json
 try:
@@ -1338,6 +1349,12 @@ PY
 repair=0
 restart_singbox=0
 mode="$(cat "$MODE_FILE" 2>/dev/null || echo proxy)"
+
+probe_proxy_egress() {
+  local out
+  out="$(curl -4 --connect-timeout "$EGRESS_CONNECT_TIMEOUT" --max-time "$EGRESS_MAX_TIME" --retry "$EGRESS_RETRIES" --retry-delay 2 -fsS "$EGRESS_PROBE_URL" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
 
 if [[ "$mode" == "local" ]]; then
   if /usr/local/bin/zck recover >/dev/null 2>&1; then
@@ -1378,15 +1395,8 @@ if (( restart_singbox )); then
   systemctl restart sing-box.service || true
 fi
 
-egress_ok=0
-for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
-  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
-    egress_ok=1
-    break
-  fi
-done
-if (( ! egress_ok )); then
-  /usr/local/bin/zck fallback "proxy IPv4 egress test failed" >/dev/null 2>&1 || true
+if ! probe_proxy_egress; then
+  /usr/local/bin/zck fallback "ip.sb proxy IPv4 egress probe failed" >/dev/null 2>&1 || true
   exit 0
 fi
 EOF
@@ -1515,10 +1525,7 @@ SYSCTL
   fi
 
   local egress_ip
-  egress_ip="$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ifconfig.me 2>/dev/null || true)"
-  if [[ -z "$egress_ip" ]]; then
-    egress_ip="$(curl -4 --connect-timeout 8 --max-time 20 -fsS https://ip.sb 2>/dev/null || true)"
-  fi
+  egress_ip="$(curl_egress_ip || true)"
   if [[ -n "$egress_ip" ]]; then
     echo "  [OK]   真实出口测试通过: $egress_ip"
     printf 'proxy\n' > "$MODE_FILE"
