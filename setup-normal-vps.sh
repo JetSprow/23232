@@ -31,6 +31,10 @@ HELPER_BIN="/usr/local/bin/wg-normal"
 CHECK_UNIT_FILE="/etc/systemd/system/wg-normal-check.service"
 CHECK_TIMER_FILE="/etc/systemd/system/wg-normal-check.timer"
 MODE_FILE="$STATE_DIR/mode"
+EGRESS_PROBE_URL="${EGRESS_PROBE_URL:-https://ip.sb}"
+EGRESS_CONNECT_TIMEOUT="${EGRESS_CONNECT_TIMEOUT:-12}"
+EGRESS_MAX_TIME="${EGRESS_MAX_TIME:-35}"
+EGRESS_RETRIES="${EGRESS_RETRIES:-2}"
 
 detect_outer_mtu() {
   local target="$1"
@@ -298,6 +302,10 @@ TCP_MSS=${TCP_MSS}
 WAN_IF=${WAN_IF}
 SSH_PORTS=${SSH_PORTS}
 MODE_FILE=${MODE_FILE}
+EGRESS_PROBE_URL=${EGRESS_PROBE_URL}
+EGRESS_CONNECT_TIMEOUT=${EGRESS_CONNECT_TIMEOUT}
+EGRESS_MAX_TIME=${EGRESS_MAX_TIME}
+EGRESS_RETRIES=${EGRESS_RETRIES}
 EOF
 chmod 600 "$CONFIG_FILE"
 printf 'home\n' > "$MODE_FILE"
@@ -402,6 +410,16 @@ cat > "$RECOVER_BIN" <<'EOF'
 set -euo pipefail
 source /etc/wg-normal/config.env
 
+probe_home_egress() {
+  local url="${EGRESS_PROBE_URL:-https://ip.sb}"
+  local connect_timeout="${EGRESS_CONNECT_TIMEOUT:-12}"
+  local max_time="${EGRESS_MAX_TIME:-35}"
+  local retries="${EGRESS_RETRIES:-2}"
+  local ip
+  ip="$(curl -4 -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" --retry "$retries" --retry-delay 2 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 logger -t wg-normal-recover "attempting home egress recovery"
 
 /usr/local/sbin/wg-normal-apply || {
@@ -409,31 +427,22 @@ logger -t wg-normal-recover "attempting home egress recovery"
   exit 1
 }
 
-sleep 3
+sleep 6
 
 latest="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2; exit}' || true)"
 now="$(date +%s)"
-if [[ -z "$latest" || "$latest" == "0" || $((now - latest)) -gt 180 ]]; then
-  /usr/local/sbin/wg-normal-fallback "WireGuard handshake unavailable after recovery"
-  exit 1
+if [[ -z "$latest" || "$latest" == "0" || $((now - latest)) -gt 900 ]]; then
+  logger -t wg-normal-recover "WireGuard handshake looks stale after recovery; verifying with curl egress probe"
 fi
 
-ok=0
-for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
-  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
-    ok=1
-    break
-  fi
-done
-
-if (( ok )); then
+if probe_home_egress; then
   printf 'home\n' > "$MODE_FILE"
   chmod 600 "$MODE_FILE"
   logger -t wg-normal-recover "home egress recovered"
   exit 0
 fi
 
-/usr/local/sbin/wg-normal-fallback "IPv4 egress test failed after recovery"
+/usr/local/sbin/wg-normal-fallback "ip.sb IPv4 egress probe failed after recovery"
 exit 1
 EOF
 chmod 755 "$RECOVER_BIN"
@@ -445,7 +454,19 @@ source /etc/wg-normal/config.env
 
 repair=0
 restart=0
+soft_probe=0
 mode="$(cat "$MODE_FILE" 2>/dev/null || echo home)"
+
+probe_home_egress() {
+  local url="${EGRESS_PROBE_URL:-https://ip.sb}"
+  local connect_timeout="${EGRESS_CONNECT_TIMEOUT:-12}"
+  local max_time="${EGRESS_MAX_TIME:-35}"
+  local retries="${EGRESS_RETRIES:-2}"
+  local ip
+  ip="$(curl -4 -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" --retry "$retries" --retry-delay 2 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 if [[ "$mode" == "local" ]]; then
   if /usr/local/sbin/wg-normal-recover; then
     exit 0
@@ -497,11 +518,11 @@ else
   now="$(date +%s)"
   latest="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2; exit}')"
   if [[ -z "$latest" || "$latest" == "0" ]]; then
-    restart=1
-    need_repair "WireGuard has no handshake"
-  elif (( now - latest > 180 )); then
-    restart=1
-    need_repair "WireGuard handshake is stale: $((now - latest))s"
+    soft_probe=1
+    logger -t wg-normal-check "WireGuard has no handshake; will verify with curl egress probe"
+  elif (( now - latest > 900 )); then
+    soft_probe=1
+    logger -t wg-normal-check "WireGuard handshake is stale: $((now - latest))s; will verify with curl egress probe"
   fi
 fi
 
@@ -518,16 +539,20 @@ if (( repair )); then
     exit 0
   fi
 fi
-
-egress_ok=0
-for url in https://api.ipify.org https://ip.sb https://ifconfig.me; do
-  if curl -4 --connect-timeout 8 --max-time 20 -fsS "$url" >/dev/null 2>&1; then
-    egress_ok=1
-    break
+if (( soft_probe )); then
+  if probe_home_egress; then
+    printf 'home\n' > "$MODE_FILE"
+    chmod 600 "$MODE_FILE"
+    logger -t wg-normal-check "home egress probe passed; keep home mode despite handshake signal"
+    exit 0
   fi
-done
-if (( ! egress_ok )); then
-  /usr/local/sbin/wg-normal-fallback "home IPv4 egress test failed"
+  if ! /usr/local/sbin/wg-normal-recover; then
+    exit 0
+  fi
+fi
+
+if ! probe_home_egress; then
+  /usr/local/sbin/wg-normal-fallback "ip.sb IPv4 egress probe failed"
   exit 0
 fi
 EOF
@@ -603,7 +628,7 @@ systemctl enable --now wg-normal-check.timer >/dev/null 2>&1 || true
 sleep 2
 echo
 echo "==> 验证 (出口 IP 应为家宽 IP)"
-NEW_IP="$(curl -4 -s --max-time 8 ifconfig.me | tr -d '\r\n' || echo '获取失败')"
+NEW_IP="$(curl -4 -fsS --connect-timeout "$EGRESS_CONNECT_TIMEOUT" --max-time "$EGRESS_MAX_TIME" --retry "$EGRESS_RETRIES" --retry-delay 2 "$EGRESS_PROBE_URL" 2>/dev/null | tr -d '[:space:]' || echo '获取失败')"
 echo "    当前出口 IP: $NEW_IP"
 echo "    原公网 IP:   $PUB_IP"
 if [[ "$NEW_IP" == "$PUB_IP" || "$NEW_IP" == "获取失败" ]]; then
