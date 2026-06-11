@@ -24,7 +24,7 @@ need_root() {
 }
 
 valid_ip_or_cidr() {
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ || "$1" =~ : ]]
 }
 
 valid_port_spec() {
@@ -52,7 +52,7 @@ normalize_csv() {
 
 prompt_config() {
   if [[ -z "$ALLOW_IPS" ]]; then
-    read -r -p "普通机器公网 IPv4 白名单，多个用逗号分隔: " ALLOW_IPS
+    read -r -p "普通机器公网 IPv4/IPv6 白名单，多个用逗号分隔: " ALLOW_IPS
   fi
   ALLOW_IPS="$(normalize_csv "$ALLOW_IPS")"
   [[ -n "$ALLOW_IPS" ]] || { echo "白名单不能为空"; exit 1; }
@@ -94,22 +94,35 @@ set -euo pipefail
 source /etc/home-firewall-whitelist/config.env
 
 ipt() { iptables "$@"; }
+ipt6() { command -v ip6tables >/dev/null 2>&1 && ip6tables "$@" || true; }
+is_v6() { [[ "$1" == *:* ]]; }
 
 ipt -N "$CHAIN" 2>/dev/null || true
 ipt -F "$CHAIN"
 ipt -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ipt -A "$CHAIN" -i lo -j ACCEPT
+ipt6 -N "$CHAIN" 2>/dev/null || true
+ipt6 -F "$CHAIN"
+ipt6 -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ipt6 -A "$CHAIN" -i lo -j ACCEPT
 
 IFS=',' read -r -a allow_arr <<< "$ALLOW_IPS"
 for ip in "${allow_arr[@]}"; do
   [[ -n "$ip" ]] || continue
-  ipt -A "$CHAIN" -s "$ip" -j ACCEPT
+  if is_v6 "$ip"; then
+    ipt6 -A "$CHAIN" -s "$ip" -j ACCEPT
+  else
+    ipt -A "$CHAIN" -s "$ip" -j ACCEPT
+  fi
 done
 ipt -A "$CHAIN" -j DROP
+ipt6 -A "$CHAIN" -j DROP
 
 if [[ "${LOCKDOWN_ALL:-0}" == "1" ]]; then
   while ipt -D INPUT -j "$CHAIN" 2>/dev/null; do :; done
   ipt -I INPUT 1 -j "$CHAIN"
+  while ipt6 -D INPUT -j "$CHAIN" 2>/dev/null; do :; done
+  ipt6 -I INPUT 1 -j "$CHAIN"
   exit 0
 fi
 
@@ -120,6 +133,8 @@ for item in "${port_arr[@]}"; do
   proto="${item#*/}"
   while ipt -D INPUT -p "$proto" --dport "$port" -j "$CHAIN" 2>/dev/null; do :; done
   ipt -I INPUT 1 -p "$proto" --dport "$port" -j "$CHAIN"
+  while ipt6 -D INPUT -p "$proto" --dport "$port" -j "$CHAIN" 2>/dev/null; do :; done
+  ipt6 -I INPUT 1 -p "$proto" --dport "$port" -j "$CHAIN"
 done
 SCRIPT
   chmod +x "$APPLY_BIN"
@@ -132,6 +147,7 @@ set -euo pipefail
 source /etc/home-firewall-whitelist/config.env 2>/dev/null || exit 0
 if [[ "${LOCKDOWN_ALL:-0}" == "1" ]]; then
   while iptables -D INPUT -j "${CHAIN:-HOME-WHITELIST}" 2>/dev/null; do :; done
+  while ip6tables -D INPUT -j "${CHAIN:-HOME-WHITELIST}" 2>/dev/null; do :; done
 fi
 IFS=',' read -r -a port_arr <<< "${PROTECT_PORTS:-}"
 for item in "${port_arr[@]}"; do
@@ -139,9 +155,12 @@ for item in "${port_arr[@]}"; do
   port="${item%/*}"
   proto="${item#*/}"
   while iptables -D INPUT -p "$proto" --dport "$port" -j "${CHAIN:-HOME-WHITELIST}" 2>/dev/null; do :; done
+  while ip6tables -D INPUT -p "$proto" --dport "$port" -j "${CHAIN:-HOME-WHITELIST}" 2>/dev/null; do :; done
 done
 iptables -F "${CHAIN:-HOME-WHITELIST}" 2>/dev/null || true
 iptables -X "${CHAIN:-HOME-WHITELIST}" 2>/dev/null || true
+ip6tables -F "${CHAIN:-HOME-WHITELIST}" 2>/dev/null || true
+ip6tables -X "${CHAIN:-HOME-WHITELIST}" 2>/dev/null || true
 SCRIPT
   chmod +x "$REMOVE_BIN"
 }
@@ -156,6 +175,8 @@ case "${1:-status}" in
     cat "$CONFIG_FILE" 2>/dev/null || true
     iptables -S INPUT | grep HOME-WHITELIST || true
     iptables -S HOME-WHITELIST 2>/dev/null || true
+    ip6tables -S INPUT | grep HOME-WHITELIST || true
+    ip6tables -S HOME-WHITELIST 2>/dev/null || true
     systemctl status home-firewall-whitelist.service --no-pager --lines=8 2>/dev/null || true
     ;;
   apply|restart|on)
@@ -169,7 +190,7 @@ case "${1:-status}" in
     ;;
   add)
     ip="${2:-}"
-    [[ -n "$ip" ]] || { echo "usage: home-fw add 1.2.3.4"; exit 2; }
+    [[ -n "$ip" ]] || { echo "usage: home-fw add 1.2.3.4 或 2001:db8::1"; exit 2; }
     source "$CONFIG_FILE"
     if [[ ",$ALLOW_IPS," != *",$ip,"* ]]; then
       sed -i "s|^ALLOW_IPS=.*|ALLOW_IPS=${ALLOW_IPS},${ip}|" "$CONFIG_FILE"
@@ -178,7 +199,7 @@ case "${1:-status}" in
     ;;
   remove)
     ip="${2:-}"
-    [[ -n "$ip" ]] || { echo "usage: home-fw remove 1.2.3.4"; exit 2; }
+    [[ -n "$ip" ]] || { echo "usage: home-fw remove 1.2.3.4 或 2001:db8::1"; exit 2; }
     source "$CONFIG_FILE"
     new="$(printf '%s' "$ALLOW_IPS" | tr ',' '\n' | grep -v -F "$ip" | paste -sd, -)"
     sed -i "s|^ALLOW_IPS=.*|ALLOW_IPS=${new}|" "$CONFIG_FILE"

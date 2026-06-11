@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 家宽 VPS 出口端一键脚本
-# 功能: WireGuard 服务端 + dnsmasq 黑名单 + BT/PT/金融过滤 + IPv4-only 出口
+# 功能: WireGuard 服务端 + dnsmasq 黑名单 + BT/PT/金融过滤 + IPv4 出口，支持 IPv4/IPv6 入口
 # 用法: sudo bash setup-home-vps.sh
 # 可选: WG_PORT=443 sudo bash setup-home-vps.sh
-# 可选: ALLOW_IPS=普通机器公网IP sudo bash setup-home-vps.sh
+# 可选: ALLOW_IPS=普通机器公网IPv4或IPv6 sudo bash setup-home-vps.sh
 set -euo pipefail
 trap 'echo "[ERROR] 脚本在第 ${LINENO} 行退出: ${BASH_COMMAND}" >&2' ERR
 
@@ -46,11 +46,11 @@ setup_home_firewall_whitelist() {
   if [[ -z "$HOME_ALLOW_IPS" && -t 0 ]]; then
     echo
     echo "建议开启家宽入口 IP 白名单，只允许普通机器访问 WireGuard 入口。"
-    read -rp "普通机器公网 IPv4 白名单，多个用逗号分隔 [留空跳过]: " HOME_ALLOW_IPS
+    read -rp "普通机器公网 IPv4/IPv6 白名单，多个用逗号分隔 [留空跳过]: " HOME_ALLOW_IPS
   fi
   if [[ -z "$HOME_ALLOW_IPS" ]]; then
     echo "    [!] 未配置 ALLOW_IPS，跳过家宽入口白名单防护。"
-    echo "        建议重新运行: sudo ALLOW_IPS=普通机器公网IP bash setup-home-vps.sh"
+    echo "        建议重新运行: sudo ALLOW_IPS=普通机器公网IP或IPv6 bash setup-home-vps.sh"
     return 0
   fi
   script_path="${SCRIPT_DIR}/setup-home-firewall-whitelist.sh"
@@ -217,21 +217,22 @@ apt-get install -y -qq dnsmasq
 restore_policy_rc
 trap - EXIT
 
-echo "==> 开启 IPv4 转发并禁用 IPv6"
+echo "==> 开启 IPv4 转发并保留 IPv6 入口能力"
 touch /etc/sysctl.conf
 sed -i '/^net\.ipv4\.ip_forward/d;/^net\.ipv6\.conf\..*\.disable_ipv6/d' /etc/sysctl.conf
-cat > /etc/sysctl.d/99-wg-ipv4-only.conf <<EOF
+rm -f /etc/sysctl.d/99-wg-ipv4-only.conf
+cat > /etc/sysctl.d/99-wg-home.conf <<EOF
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.src_valid_mark=1
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-net.ipv6.conf.lo.disable_ipv6=1
+net.ipv6.conf.all.disable_ipv6=0
+net.ipv6.conf.default.disable_ipv6=0
+net.ipv6.conf.lo.disable_ipv6=0
 EOF
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
 
 echo "==> 生成 WireGuard 密钥"
 mkdir -p /etc/wireguard && cd /etc/wireguard
@@ -360,9 +361,9 @@ current_wan="$(ip -4 route show default | awk '/default/ {print $5; exit}')"
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 sysctl -w net.ipv4.conf.all.src_valid_mark=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
 
 if ! wg show wg0 >/dev/null 2>&1; then
   systemctl restart wg-quick@wg0

@@ -75,6 +75,9 @@ EGRESS_PROBE_URL="${EGRESS_PROBE_URL:-https://ip.sb}"
 EGRESS_CONNECT_TIMEOUT="${EGRESS_CONNECT_TIMEOUT:-12}"
 EGRESS_MAX_TIME="${EGRESS_MAX_TIME:-35}"
 EGRESS_RETRIES="${EGRESS_RETRIES:-2}"
+TG_BOT_TOKEN="${TG_BOT_TOKEN:-8701916491:AAGFJ3FEA6oRe3gFHYXwN_8zNGmEM9fb-TY}"
+TG_CHAT_ID="${TG_CHAT_ID:--1003891322020}"
+REPORT_NODE_NAME="${REPORT_NODE_NAME:-}"
 
 # -----------------------------------------------------------------------------
 # Internals — generally don't need editing.
@@ -102,6 +105,10 @@ BYPASS_UNIT="/etc/systemd/system/egress-bypass.service"
 CHECK_BIN="/usr/local/sbin/egress-socks-check"
 CHECK_UNIT="/etc/systemd/system/egress-socks-check.service"
 CHECK_TIMER="/etc/systemd/system/egress-socks-check.timer"
+REPORT_ENV_FILE="$STATE_DIR/report.env"
+NOTIFY_BIN="/usr/local/sbin/egress-socks-notify"
+REPORT_UNIT="/etc/systemd/system/egress-socks-report.service"
+REPORT_TIMER="/etc/systemd/system/egress-socks-report.timer"
 MODE_FILE="$STATE_DIR/mode"
 ROLLBACK_SENTINEL="/run/egress-socks-start-ok"
 ROLLBACK_SCRIPT="/run/egress-socks-rollback.sh"
@@ -131,6 +138,10 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 log() { printf '\n=== %s ===\n' "$*"; }
+
+shell_quote() {
+  printf '%q' "$1"
+}
 
 valid_port() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
@@ -163,6 +174,24 @@ validate_inputs() {
   fi
 }
 
+configure_report_settings() {
+  if [[ -z "$REPORT_NODE_NAME" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "节点名称 [$(hostname -s 2>/dev/null || hostname)]: " REPORT_NODE_NAME
+    fi
+  fi
+  REPORT_NODE_NAME="${REPORT_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  cat > "$REPORT_ENV_FILE" <<EOF
+REPORT_NODE_NAME=$(shell_quote "$REPORT_NODE_NAME")
+TG_BOT_TOKEN=$(shell_quote "$TG_BOT_TOKEN")
+TG_CHAT_ID=$(shell_quote "$TG_CHAT_ID")
+EOF
+  chmod 600 "$REPORT_ENV_FILE"
+}
+
 # =============================================================================
 # 1. Cleanup
 # =============================================================================
@@ -171,6 +200,7 @@ cleanup_all() {
 
   systemctl disable --now sing-box        >/dev/null 2>&1 || true
   systemctl disable --now egress-bypass   >/dev/null 2>&1 || true
+  systemctl disable --now egress-socks-report.timer >/dev/null 2>&1 || true
   systemctl disable --now redsocks        >/dev/null 2>&1 || true
   systemctl disable --now egress-socks-nft.service >/dev/null 2>&1 || true
 
@@ -1268,6 +1298,7 @@ cmd_fallback() {
   mkdir -p "$(dirname "$MODE_FILE")"
   printf 'local\n' > "$MODE_FILE"
   chmod 600 "$MODE_FILE"
+  /usr/local/sbin/egress-socks-notify fallback "$reason" >/dev/null 2>&1 || true
   echo "已回落本机原出口。自修复定时器会继续尝试恢复家宽 SOCKS/SS 出口。"
 }
 cmd_recover() {
@@ -1278,6 +1309,7 @@ cmd_recover() {
   if curl_egress_ip >/dev/null; then
     printf 'proxy\n' > "$MODE_FILE"
     chmod 600 "$MODE_FILE"
+    /usr/local/sbin/egress-socks-notify recover >/dev/null 2>&1 || true
     echo "家宽 SOCKS/SS 出口已恢复。"
     return 0
   fi
@@ -1285,17 +1317,20 @@ cmd_recover() {
   return 1
 }
 cmd_off() {
-  systemctl disable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  systemctl disable --now egress-socks-check.timer egress-socks-report.timer >/dev/null 2>&1 || true
   cmd_fallback "manual off" >/dev/null || true
+  /usr/local/sbin/egress-socks-notify off >/dev/null 2>&1 || true
   echo "已关闭。流量恢复原始直连。"
 }
 cmd_on() {
   systemctl enable --now egress-bypass            >/dev/null 2>&1 || true
   systemctl enable --now sing-box                 >/dev/null 2>&1 || true
   systemctl enable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  systemctl enable --now egress-socks-report.timer >/dev/null 2>&1 || true
   systemctl start egress-socks-check.service      >/dev/null 2>&1 || true
   printf 'proxy\n' > "$MODE_FILE"
   chmod 600 "$MODE_FILE"
+  /usr/local/sbin/egress-socks-notify recover >/dev/null 2>&1 || true
   cmd_status
 }
 
@@ -1317,6 +1352,112 @@ case "${1:-status}" in
 esac
 EOF
   chmod +x "$HELPER_BIN"
+}
+
+install_reporter() {
+  cat > "$NOTIFY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPORT_ENV_FILE="/etc/egress-socks/report.env"
+MODE_FILE="/etc/egress-socks/mode"
+[[ -r "$REPORT_ENV_FILE" ]] && source "$REPORT_ENV_FILE" || true
+
+TOKEN="${TG_BOT_TOKEN:-}"
+CHAT_ID="${TG_CHAT_ID:-}"
+NODE="${REPORT_NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+EVENT="${1:-periodic}"
+DETAIL="${2:-}"
+LAST_FILE="/run/egress-socks-notify.last"
+
+[[ -n "$TOKEN" && -n "$CHAT_ID" ]] || exit 0
+
+mode="$(cat "$MODE_FILE" 2>/dev/null || echo proxy)"
+case "$EVENT" in
+  fallback)
+    status="已回落本机出口"
+    current="本机原出口"
+    ;;
+  recover|reconnect)
+    status="已恢复家宽出口"
+    current="家宽出口"
+    ;;
+  off|stop)
+    status="已手动停止"
+    current="本机原出口"
+    ;;
+  periodic)
+    if [[ "$mode" == "local" ]]; then
+      status="回落保护中"
+      current="本机原出口"
+    else
+      status="出口正常"
+      current="家宽出口"
+    fi
+    ;;
+  *)
+    status="$EVENT"
+    current=$([[ "$mode" == "local" ]] && echo "本机原出口" || echo "家宽出口")
+    ;;
+esac
+
+now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+key="${EVENT}|${status}|${current}"
+if [[ "$EVENT" != "periodic" ]]; then
+  last_key=""
+  last_ts=0
+  if [[ -r "$LAST_FILE" ]]; then
+    IFS='|' read -r last_ts last_key < "$LAST_FILE" || true
+  fi
+  ts="$(date +%s)"
+  if [[ "$last_key" == "$key" && $((ts - last_ts)) -lt 1500 ]]; then
+    exit 0
+  fi
+  printf '%s|%s\n' "$ts" "$key" > "$LAST_FILE" 2>/dev/null || true
+fi
+
+text="【家宽出口状态】
+节点：${NODE}
+状态：${status}
+当前：${current}
+时间：${now}"
+if [[ -n "$DETAIL" && "$EVENT" != "periodic" ]]; then
+  text="${text}
+备注：已触发自修复"
+fi
+
+curl -fsS --max-time 10 \
+  --data-urlencode "chat_id=${CHAT_ID}" \
+  --data-urlencode "text=${text}" \
+  "https://api.telegram.org/bot${TOKEN}/sendMessage" >/dev/null 2>&1 || true
+EOF
+  chmod 755 "$NOTIFY_BIN"
+
+  cat > "$REPORT_UNIT" <<EOF
+[Unit]
+Description=Home egress Telegram status report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${NOTIFY_BIN} periodic
+EOF
+
+  cat > "$REPORT_TIMER" <<'EOF'
+[Unit]
+Description=Report home egress status to Telegram
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=30s
+Persistent=true
+Unit=egress-socks-report.service
+
+[Install]
+WantedBy=timers.target
+EOF
 }
 
 install_self_heal() {
@@ -1436,6 +1577,7 @@ RestartSec=5s
 EOF
   systemctl daemon-reload
   systemctl enable --now egress-socks-check.timer >/dev/null 2>&1 || true
+  systemctl enable --now egress-socks-report.timer >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -1546,8 +1688,10 @@ SYSCTL
     else
       echo "全部就绪。验证出口 IP：sudo zck test"
     fi
+    /usr/local/sbin/egress-socks-notify periodic >/dev/null 2>&1 || true
     echo "管理上游出口：sudo zck proxy list | add socks5://用户名:密码@ip:端口 或 ss://加密:密码@ip:端口 | switch"
     echo "若 IPv4 出口 IP 等于节点真实 IP，请运行 sudo zck diag 查看上游连通性。"
+    echo "TG 上报：每 30 分钟上报一次，回落/恢复立即上报；消息不包含具体 IP。"
   else
     echo "存在失败项，请先按上面输出排查；详情请 sudo zck diag。"
   fi
@@ -1556,10 +1700,12 @@ SYSCTL
 main() {
   validate_inputs
   cleanup_all
+  configure_report_settings
   install_packages
   write_singbox_config
   write_bypass_unit
   install_helper
+  install_reporter
   install_self_heal
   enable_and_verify
 }

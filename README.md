@@ -2,11 +2,11 @@
 
 这个仓库包含以下脚本：
 
-- `setup-home-vps.sh`：家宽 VPS 出口端，配置 WireGuard 服务端、NAT、DNS 与基础过滤规则。
-- `setup-normal-vps.sh`：普通 VPS 客户端，将 IPv4 出口切到家宽 VPS，并保留 SSH 连接。
+- `setup-home-vps.sh`：家宽 VPS 出口端，配置 WireGuard 服务端、NAT、DNS 与基础过滤规则，入口支持 IPv4/IPv6。
+- `setup-normal-vps.sh`：普通 VPS 客户端，将 IPv4 出口切到家宽 VPS，并保留 SSH 连接；家宽 Endpoint 优先 IPv4，IPv4 不存在或失败时自动尝试 IPv6。
 - `setup-home-socks5.sh`：家宽 VPS SOCKS5 服务端，创建账号密码并输出可复制的 SOCKS5 地址。
 - `setup-home-ss.sh`：家宽 VPS Shadowsocks 服务端，适合 SOCKS5 被线路 reset 时使用。
-- `setup-home-firewall-whitelist.sh`：家宽入口 IP 白名单防护，只允许普通机器 IP 访问家宽入口端口，其他来源 DROP。
+- `setup-home-firewall-whitelist.sh`：家宽入口 IP 白名单防护，只允许普通机器 IPv4/IPv6 访问家宽入口端口，其他来源 DROP。
 - `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5 或 Shadowsocks。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
@@ -63,7 +63,7 @@ sudo bash setup-home-vps.sh
 只允许普通机器访问家宽 WireGuard 入口：
 
 ```bash
-sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' bash setup-home-vps.sh
+sudo ALLOW_IPS='普通机器公网IPv4或IPv6,普通机器公网IPv4或IPv6' bash setup-home-vps.sh
 ```
 
 普通 VPS 客户端：
@@ -90,7 +90,7 @@ sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' bash setup-home-soc
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-home-firewall-whitelist.sh -o setup-home-firewall-whitelist.sh
-sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' PROTECT_PORTS='51820/udp,6013/tcp,6013/udp' bash setup-home-firewall-whitelist.sh
+sudo ALLOW_IPS='普通机器公网IPv4或IPv6,普通机器公网IPv4或IPv6' PROTECT_PORTS='51820/udp,6013/tcp,6013/udp' bash setup-home-firewall-whitelist.sh
 ```
 
 只允许白名单 IP 访问这些入口端口，其他来源直接 DROP。默认不修改 SSH，也不改全局默认策略，避免误锁机器。
@@ -98,10 +98,12 @@ sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' PROTECT_PORTS='5182
 如果确认管理入口也只会从普通机器访问，可以开启全入口锁定：
 
 ```bash
-sudo ALLOW_IPS='普通机器公网IP1,普通机器公网IP2' LOCKDOWN_ALL=1 bash setup-home-firewall-whitelist.sh
+sudo ALLOW_IPS='普通机器公网IPv4或IPv6,普通机器公网IPv4或IPv6' LOCKDOWN_ALL=1 bash setup-home-firewall-whitelist.sh
 ```
 
-`LOCKDOWN_ALL=1` 会让所有入站只接受白名单 IP 和已建立连接，使用前务必确认当前 SSH 来源已经在白名单内。
+`LOCKDOWN_ALL=1` 会让所有入站只接受白名单 IP 和已建立连接，使用前务必确认当前 SSH 来源 IPv4/IPv6 已经在白名单内。
+
+普通 VPS 端填写家宽 Endpoint 时可以填 IPv4、IPv6 或 DDNS 域名。脚本每 5 分钟自检一次：优先解析并尝试 IPv4；IPv4 不存在或探测失败时会尝试 IPv6；家宽出口整体不可用时自动回落本机原出口，下一轮继续优先检查 IPv4 是否恢复。
 
 `setup-home-vps.sh`、`setup-home-socks5.sh`、`setup-home-ss.sh` 已内置调用该白名单脚本。传入 `ALLOW_IPS` 时会自动保护对应服务入口端口：WireGuard 保护 `${WG_PORT}/udp`，SOCKS5 保护 `${SOCKS_PORT}/tcp`，Shadowsocks 保护 `${SS_PORT}/tcp`。默认不会锁 SSH；需要全入口锁定时再额外传 `LOCKDOWN_ALL=1`。
 
@@ -230,7 +232,13 @@ sudo wg-normal stop
 sudo wg-normal logs -n 80
 ```
 
-普通 WireGuard 客户端会优先使用家宽出口；如果家宽端 WireGuard 握手失效、动态 IP 未恢复、或真实 IPv4 出口测试不通，会自动撤销策略路由并回落到普通 VPS 本机原出口，避免整机断网。回落后 `wg-normal-check.timer` 每 5 分钟尝试一次家宽出口，恢复成功后再切回。
+普通 WireGuard 客户端会优先使用家宽出口；如果家宽端 WireGuard 握手失效、动态 IP 未恢复、或真实 IPv4 出口测试不通，会自动撤销策略路由并回落到普通 VPS 本机原出口，避免整机断网。回落后 `wg-normal-check.timer` 每 5 分钟优先尝试 IPv4 Endpoint，IPv4 不存在或失败时再尝试 IPv6 Endpoint，恢复成功后再切回。
+
+安装普通 WireGuard 客户端时会要求输入节点名称。脚本内置 Telegram 群上报配置，安装完成后每 30 分钟上报一次出口状态，回落本机出口、恢复家宽出口、手动停止会立即上报。群提醒只包含节点名、出口状态、当前出口和时间，不包含具体 IP、Endpoint、上游地址或线路方法。需要覆盖默认节点名时可提前传入：
+
+```bash
+sudo REPORT_NODE_NAME='SJC-01' bash setup-normal-vps.sh
+```
 
 家宽 SOCKS5 / Shadowsocks：
 
@@ -256,6 +264,12 @@ sudo zck diag
 ```
 
 普通机器 SOCKS5 / Shadowsocks 代理出口同样带回落保护：上游代理出口不通时会停掉 sing-box/TUN 并恢复本机原出口，但保留自修复定时器；之后每 5 分钟自动尝试恢复代理出口。
+
+安装普通机器代理出口时同样会要求输入节点名称，并启用 Telegram 状态上报。默认每 30 分钟上报一次，回落/恢复立即上报。群提醒只包含节点名、出口状态、当前出口和时间，不包含具体 IP 或线路方法。无交互安装可提前传入节点名：
+
+```bash
+sudo REPORT_NODE_NAME='SJC-01' BUILTIN_PROXY_URL='socks5://用户名:密码@地址:端口' bash setup-egress-socks.sh
+```
 
 GRE / WireGuard 优化线路：
 
