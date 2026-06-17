@@ -342,8 +342,8 @@ if url.scheme not in ("socks5", "ss"):
     raise SystemExit("只支持 socks5:// 或 ss://")
 if not url.hostname or not url.port:
     raise SystemExit("格式错误，应为 socks5://用户名:密码@地址:端口 或 ss://加密:密码@地址:端口")
-if url.scheme == "socks5" and (not url.username or url.password is None):
-    raise SystemExit("SOCKS5 格式错误，必须包含用户名和密码")
+if url.scheme == "socks5" and (url.username is None) != (url.password is None):
+    raise SystemExit("SOCKS5 格式错误，账号密码要么都填(socks5://用户名:密码@地址:端口)，要么都不填(socks5://地址:端口，用于无认证隧道)")
 if url.scheme == "ss":
     method = urllib.parse.unquote(url.username or "")
     password = urllib.parse.unquote(url.password or "")
@@ -399,7 +399,12 @@ user = urllib.parse.quote(os.environ["ACTIVE_PROXY_USER"], safe="")
 password = urllib.parse.quote(os.environ["ACTIVE_PROXY_PASS"], safe="")
 host = os.environ["ACTIVE_PROXY_HOST"]
 port = os.environ["ACTIVE_PROXY_PORT"]
-print(f"socks5://{user}:{password}@{host}:{port}")
+# Unauthenticated SOCKS5 (SSH -D tunnel): emit socks5://host:port without an
+# empty "user:pass@", which curl would otherwise treat as a literal credential.
+if user or password:
+    print(f"socks5://{user}:{password}@{host}:{port}")
+else:
+    print(f"socks5://{host}:{port}")
 PY
 }
 
@@ -527,9 +532,13 @@ else:
         "server": proxy_ip,
         "server_port": int(proxy_port),
         "version": "5",
-        "username": proxy_user,
-        "password": proxy_pass,
     }
+    # Omit credentials entirely for unauthenticated SOCKS5 (e.g. an SSH `-D`
+    # dynamic tunnel), which has no username/password. Sending empty strings
+    # would make sing-box attempt user/pass auth and fail.
+    if proxy_user or proxy_pass:
+        proxy_outbound["username"] = proxy_user
+        proxy_outbound["password"] = proxy_pass
 
 cfg = {
     "log": {"level": "info", "timestamp": True},
@@ -874,10 +883,10 @@ method = ""
 password = ""
 username = ""
 if url.scheme == "socks5":
-    if not url.username or url.password is None:
-        raise SystemExit("SOCKS5 格式错误，必须包含 用户名:密码")
-    username = urllib.parse.unquote(url.username)
-    password = urllib.parse.unquote(url.password or "")
+    if (url.username is None) != (url.password is None):
+        raise SystemExit("SOCKS5 格式错误，账号密码要么都填(socks5://用户名:密码@ip:端口)，要么都不填(socks5://ip:端口，用于无认证隧道)")
+    username = urllib.parse.unquote(url.username) if url.username is not None else ""
+    password = urllib.parse.unquote(url.password) if url.password is not None else ""
 else:
     method = urllib.parse.unquote(url.username or "")
     password = urllib.parse.unquote(url.password or "")
@@ -925,7 +934,8 @@ else:
         json.dump(items, f, ensure_ascii=False, indent=2)
         f.write("\n")
     label = item["username"] or item["method"]
-    print(f"已添加：#{len(items)} [{item['type']}] {label}@{item['host']}:{item['port']}")
+    prefix = f"{label}@" if label else ""
+    print(f"已添加：#{len(items)} [{item['type']}] {prefix}{item['host']}:{item['port']}")
 PY
   chmod 600 "$PROXY_LIST_FILE"
 }
