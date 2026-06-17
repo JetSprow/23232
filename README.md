@@ -8,6 +8,7 @@
 - `setup-home-ss.sh`：家宽 VPS Shadowsocks 服务端，适合 SOCKS5 被线路 reset 时使用。
 - `setup-home-firewall-whitelist.sh`：家宽入口 IP 白名单防护，只允许普通机器 IPv4/IPv6 访问家宽入口端口，其他来源 DROP。
 - `setup-egress-socks.sh`：普通机器客户端，将节点和 Incus 小鸡出口切到上游 SOCKS5 或 Shadowsocks。
+- `setup-ssh-socks.sh`：普通 VPS 客户端，建立到家宽/上游机器的持久 `ssh -N -D` 动态 SOCKS5 隧道，systemd 常驻、断线自动重连、自愈检查，本机 `127.0.0.1:1080` 即家宽出口，可配合 `setup-egress-socks.sh` 切换出口。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
 - `setup-wg-gateway.sh`：优化线路节点 WireGuard 网关，替代 GRE，适合 GRE 导致 HTTPS/TLS 卡住的线路。
@@ -206,6 +207,44 @@ sudo zck proxy switch
 sudo zck restart
 sudo zck test
 ```
+
+## 持久化 SSH SOCKS 隧道模式
+
+当家宽机器只开放 SSH（没有单独的 SOCKS5/SS 服务），可以在普通 VPS 上用 `setup-ssh-socks.sh` 建立一条常驻的 `ssh -N -D` 动态隧道，本机 `127.0.0.1:1080` 就是家宽出口。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-ssh-socks.sh -o setup-ssh-socks.sh
+sudo bash setup-ssh-socks.sh
+# 交互处可直接粘贴完整命令: ssh -N -D 1080 -p 2311 debian@vm111.example.com
+```
+
+也可用环境变量免交互：
+
+```bash
+sudo SSH_HOST=vm111.example.com SSH_PORT=2311 SSH_USER=debian SOCKS_PORT=1080 bash setup-ssh-socks.sh
+# 或直接传整条命令
+sudo SSH_CMD='ssh -N -D 1080 -p 2311 debian@vm111.example.com' bash setup-ssh-socks.sh
+```
+
+脚本会创建专用系统用户 `sshsocks`、生成 ed25519 密钥并交互式安装公钥到上游（首次需输入一次远程 SSH 密码）。隧道由 systemd `ssh-socks.service` 常驻，`Restart=always` 加 SSH 保活（`ServerAliveInterval`）在断线或链路假死时自动重连；`ssh-socks-check.timer` 每 60 秒检查服务、端口与出口连通性，异常自动重启。
+
+管理命令：
+
+```bash
+ssh-socks status     # 服务与端口状态
+ssh-socks test       # 经隧道测试出口 IP
+ssh-socks restart    # 重启隧道
+ssh-socks show       # 显示本地 socks 地址与上游
+ssh-socks logs -n 80 # 查看日志
+```
+
+隧道起来后，把本机或小鸡出口切到这条 SOCKS：
+
+```bash
+sudo bash setup-egress-socks.sh   # 上游填 socks5://127.0.0.1:1080
+```
+
+> SSH 动态转发（`-D`）本身没有认证，脚本默认只监听 `127.0.0.1`。若改 `BIND_ADDR` 绑公网会被强制警告——那等于开放一个无密码公网代理，务必配合防火墙白名单。
 
 ## 自动化运维和自修复
 

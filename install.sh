@@ -80,6 +80,7 @@ ensure_repo() {
         setup-home-firewall-whitelist.sh \
         setup-egress-socks.sh setup-gre-gateway.sh setup-gre-backend.sh \
         setup-wg-gateway.sh setup-wg-backend.sh setup-ab-entry.sh setup-ab-relay.sh \
+        setup-ssh-socks.sh \
         diagnose-github-raw.sh; do
         curl -fsSL "${RAW_BASE}/${f}" | as_root tee "${INSTALL_DIR}/${f}" >/dev/null
       done
@@ -147,12 +148,13 @@ menu() {
   6. GRE 优化线路网关端
   7. GRE 优化线路普通节点端
   8. WireGuard 优化线路网关端
- 9. WireGuard 优化线路普通节点端
-10. 三机 AB 隧道 A 入口机
-11. 三机 AB 隧道 B 中继机
+  9. WireGuard 优化线路普通节点端
+ 10. 三机 AB 隧道 A 入口机
+ 11. 三机 AB 隧道 B 中继机
  12. 家宽入口 IP 白名单防护
  13. GitHub Raw / HTTPS 卡住诊断
  14. 更新本地脚本
+ 15. 持久化 SSH SOCKS 代理隧道 (普通 VPS 配家宽出口)
   0. 退出
 EOF
 }
@@ -332,6 +334,26 @@ run_diagnose() {
   run_script diagnose-github-raw.sh
 }
 
+install_ssh_socks() {
+  local cmd host port user socks
+  echo "可直接粘贴完整 ssh 命令（如: ssh -N -D 1080 -p 2311 debian@vm111.example.com），留空则逐项输入。"
+  cmd="$(ask "ssh 命令，留空逐项输入" "")"
+  if [[ -n "$cmd" ]]; then
+    run_script setup-ssh-socks.sh "SSH_CMD=${cmd}"
+    return
+  fi
+  host="$(ask "上游/家宽 SSH 主机 (IP 或域名)" "")"
+  [[ -n "$host" ]] || { echo "SSH 主机不能为空"; return 1; }
+  port="$(ask "SSH 端口" "22")"
+  valid_port "$port" || { echo "端口无效"; return 1; }
+  user="$(ask "SSH 用户名 (如 debian)" "")"
+  [[ -n "$user" ]] || { echo "SSH 用户名不能为空"; return 1; }
+  socks="$(ask "本地 SOCKS5 监听端口" "1080")"
+  valid_port "$socks" || { echo "端口无效"; return 1; }
+  run_script setup-ssh-socks.sh \
+    "SSH_HOST=${host}" "SSH_PORT=${port}" "SSH_USER=${user}" "SOCKS_PORT=${socks}"
+}
+
 main() {
   need_root
   install_base_tools
@@ -358,6 +380,7 @@ main() {
       12) install_home_firewall_whitelist; pause ;;
       13) run_diagnose; pause ;;
       14) ensure_repo; echo "已更新 ${INSTALL_DIR}"; pause ;;
+      15) install_ssh_socks; pause ;;
       0) exit 0 ;;
       *) echo "无效序号"; pause ;;
     esac
