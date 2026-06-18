@@ -246,6 +246,10 @@ ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev
 ip rule add from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF"
 ip rule del from "$NODE_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))" 2>/dev/null || true
 ip rule add from "$NODE_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))"
+# 入站连接回程原路返回：带标记 0x1 的包查 main 表，从节点 WAN 出去（修复入站端口/SSH 握手失败）。
+# 优先级必须高于上面的小鸡出向规则（pref 数字更小先匹配）。
+ip rule del fwmark 0x1/0x1 lookup main pref "$((GRE_RULE_PREF - 1))" 2>/dev/null || true
+ip rule add fwmark 0x1/0x1 lookup main pref "$((GRE_RULE_PREF - 1))"
 ip route flush cache 2>/dev/null || true
 
 while iptables -t mangle -S FORWARD 2>/dev/null | grep -F -- "-o $GRE_NAME " | grep -F -- "-j TCPMSS" >/tmp/gre-node-mss 2>/dev/null; do
@@ -259,6 +263,14 @@ rm -f /tmp/gre-node-mss
 iptables -C INPUT -p 47 -s "$HOME_PUBLIC_IP" -j ACCEPT 2>/dev/null || iptables -I INPUT -p 47 -s "$HOME_PUBLIC_IP" -j ACCEPT
 iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT
 iptables -C FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT
+# 入站连接放行：客户端经节点 WAN 进来再 DNAT 到小鸡，及其回程。
+iptables -C FORWARD -i "$WAN_IF" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WAN_IF" -o "$INCUS_BRIDGE" -j ACCEPT
+iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$INCUS_BRIDGE" -o "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# connmark：从节点 WAN 进来的新连接打标 0x1，并把连接标记恢复到每个包上。
+# 配合上面 "fwmark 0x1 lookup main" 规则，让入站连接的回程包原路从节点 WAN 出去，
+# 而小鸡主动发起的连接无此标记，仍落到 table 2011 走家宽出口。修复入站端口/SSH 握手失败。
+iptables -t mangle -C PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x1
+iptables -t mangle -C PREROUTING -j CONNMARK --restore-mark 2>/dev/null || iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
 # 小鸡出向不在本机做 SNAT（由家宽出口端 SNAT），这里 RETURN 跳过本机 NAT
 iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN
 iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
@@ -296,9 +308,14 @@ ip route show table "$GRE_TABLE" | grep -Eq "^default via ${HOME_TUN_IP} dev ${G
 ip route show table "$GRE_TABLE" | grep -F "$GUEST_SUBNET" | grep -F "dev $INCUS_BRIDGE" >/dev/null || need_repair "missing guest route in table"
 ip rule show | grep -F "from $GUEST_SUBNET lookup $GRE_TABLE" >/dev/null || need_repair "missing guest ip rule"
 ip rule show | grep -F "from $NODE_TUN_IP lookup $GRE_TABLE" >/dev/null || need_repair "missing tunnel ip rule"
+ip rule show | grep -F "lookup main" | grep -F "0x1" >/dev/null || need_repair "missing inbound fwmark rule"
 iptables -C INPUT -p 47 -s "${resolved_home:-$HOME_PUBLIC_IP}" -j ACCEPT 2>/dev/null || need_repair "missing GRE input rule"
 iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null || need_repair "missing guest->GRE forward"
 iptables -C FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || need_repair "missing GRE->guest forward"
+iptables -C FORWARD -i "$WAN_IF" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || need_repair "missing WAN->guest forward"
+iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || need_repair "missing guest->WAN return forward"
+iptables -t mangle -C PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x1 2>/dev/null || need_repair "missing connmark set"
+iptables -t mangle -C PREROUTING -j CONNMARK --restore-mark 2>/dev/null || need_repair "missing connmark restore"
 iptables -t nat -C POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null || need_repair "missing NAT return"
 iptables -t mangle -C FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing outbound MSS"
 iptables -t mangle -C FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || need_repair "missing inbound MSS"
@@ -318,14 +335,19 @@ set -euo pipefail
 source /etc/gre-node/config.env
 while iptables -t mangle -D FORWARD -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
 while iptables -t mangle -D FORWARD -i "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+while iptables -t mangle -D PREROUTING -i "$WAN_IF" -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x1 2>/dev/null; do :; done
+while iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null; do :; done
 while iptables -t nat -D POSTROUTING -s "$GUEST_SUBNET" -o "$GRE_NAME" -j RETURN 2>/dev/null; do :; done
 for proto in tcp udp; do
   comment="GRE-NODE-RANGE ${proto}:${PREFORWARD_RANGE}"
   while iptables -D INPUT -i "$GRE_NAME" -p "$proto" -d "$NODE_TUN_IP" --dport "$PREFORWARD_RANGE" -m comment --comment "$comment" -j ACCEPT 2>/dev/null; do :; done
 done
+while iptables -D FORWARD -i "$INCUS_BRIDGE" -o "$WAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+while iptables -D FORWARD -i "$WAN_IF" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null; do :; done
 while iptables -D INPUT -p 47 -s "$HOME_PUBLIC_IP" -j ACCEPT 2>/dev/null; do :; done
+ip rule del fwmark 0x1/0x1 lookup main pref "$((GRE_RULE_PREF - 1))" 2>/dev/null || true
 ip rule del from "$NODE_TUN_IP" table "$GRE_TABLE" pref "$((GRE_RULE_PREF + 1))" 2>/dev/null || true
 ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev/null || true
 ip route flush table "$GRE_TABLE" 2>/dev/null || true
