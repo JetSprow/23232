@@ -32,7 +32,7 @@ MSS_NFT_TABLE="inet egress-tune-mss"
 MSS_NFT_FILE="$STATE_DIR/egress-tune-mss.nft"
 
 # 测速目标(可换):大文件 + speedtest 风格端点
-SPEED_URL_DEFAULT="https://speed.cloudflare.com/__down?bytes=104857600"   # 100MB
+SPEED_URL_DEFAULT="https://hil.proof.ovh.us/files/1Gb.dat"   # OVH 1Gb 测试文件(由 --max-time 限时,不会下满)
 PARALLEL_STREAMS=4
 
 C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
