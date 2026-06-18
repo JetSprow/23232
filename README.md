@@ -11,6 +11,8 @@
 - `setup-ssh-socks.sh`：普通 VPS 客户端，建立到家宽/上游机器的持久 `ssh -N -D` 动态 SOCKS5 隧道，systemd 常驻、断线自动重连、自愈检查，本机 `127.0.0.1:1080` 即家宽出口，可配合 `setup-egress-socks.sh` 切换出口。
 - `setup-gre-gateway.sh`：优化线路节点 GRE 网关，负责小鸡公网入口、DNAT 和出口 SNAT。
 - `setup-gre-backend.sh`：普通 Incus 节点 GRE 后端，让小鸡流量走优化线路网关。
+- `setup-gre-home.sh`：家宽出口端 GRE 脚本，在有公网 IP 的家宽机器上运行，与普通节点建隧道，让普通节点的小鸡经 GRE 从家宽公网 IP 出网，自动探测路径 MTU、MSS 跟随 clamp。
+- `setup-gre-node.sh`：普通 Incus 节点 GRE 对接脚本，与家宽出口建隧道，用策略路由仅让小鸡网段走家宽出口，宿主机自身默认出口不变；自动关闭 incusbr0 自带 NAT 以避免源 IP 被改写。
 - `setup-wg-gateway.sh`：优化线路节点 WireGuard 网关，替代 GRE，适合 GRE 导致 HTTPS/TLS 卡住的线路。
 - `setup-wg-backend.sh`：普通 Incus 节点 WireGuard 后端，让小鸡通过 WG 走优化线路网关。
 - `setup-ab-entry.sh`：三机 AB 隧道 A 入口机，用户访问 A，流量经 A-B WireGuard 隧道进入 B。
@@ -332,6 +334,20 @@ sudo wg-be repair
 sudo wg-be restart
 ```
 
+GRE 家宽出口双机：
+
+```bash
+sudo gre-home status
+sudo gre-home repair
+sudo gre-home restart
+sudo gre-home logs -n 80
+
+sudo gre-node status
+sudo gre-node repair
+sudo gre-node restart
+sudo gre-node logs -n 80
+```
+
 定时器状态：
 
 ```bash
@@ -384,6 +400,13 @@ GRE 优化线路：
 ```bash
 sudo gre-be off
 sudo gre-gw off
+```
+
+GRE 家宽出口双机：
+
+```bash
+sudo gre-node off
+sudo gre-home off
 ```
 
 WireGuard 优化线路：
@@ -496,7 +519,110 @@ sudo GRE_MTU=1180 TCP_MSS=1140 GATEWAY_PUBLIC_IP=优化节点公网IP GUEST_SUBN
 incus exec 实例名 -- sh -lc 'apk update || true; wget -O- https://api.ipify.org'
 ```
 
-## WireGuard 优化线路模式
+## GRE 家宽出口双机模式
+
+适合“小鸡建在普通 VPS 节点，但出口想走家宽公网 IP”的场景：
+
+```text
+小鸡(普通节点 incusbr0 网段)
+   -> 普通节点 GRE 隧道(策略路由，仅小鸡网段)
+   -> 家宽出口机
+   -> 家宽公网 IP 出网(SNAT)
+```
+
+普通节点宿主机自身的默认出口保持原线路不变，只有小鸡网段走家宽出口。这套脚本（`setup-gre-home.sh` + `setup-gre-node.sh`）和旧的 `setup-gre-gateway.sh`/`setup-gre-backend.sh` **并存**，设备名（`gre-link`）、隧道网段（`10.255.1.0/30`）、路由表（`2011`）、状态目录（`/etc/gre-home`、`/etc/gre-node`）都不同，互不冲突。
+
+小鸡网段就是普通节点 `incusbr0` 现有的 IPv4 网段，可在普通节点查看：
+
+```bash
+ip -4 addr show incusbr0
+```
+
+1. 先在【家宽出口机】运行（填普通节点公网 IP）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-gre-home.sh -o setup-gre-home.sh
+sudo NODE_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-home.sh
+```
+
+脚本会自动 DF-ping 探测到普通节点的路径 MTU，扣掉 GRE 24B 开销得出 GRE MTU，并把配对命令（含算好的 `GRE_MTU`）打印出来。
+
+2. 复制上一步打印的配对命令，在【普通 Incus 节点】运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/setup-gre-node.sh -o setup-gre-node.sh
+sudo HOME_PUBLIC_IP=家宽出口公网IP \
+     GUEST_SUBNET=10.10.0.0/22 \
+     GRE_MTU=家宽端打印的值 \
+     bash setup-gre-node.sh
+```
+
+> 两端 `GRE_MTU` 必须一致，直接用家宽端打印出来的值最稳妥。`GUEST_SUBNET` 两端也必须相同。
+
+3. 验证：
+
+```bash
+# 两端互 ping 隧道地址（家宽端 10.255.1.1，节点端 10.255.1.2）
+ping -c3 10.255.1.1
+
+# 进任一小鸡内查出口 IP，应返回家宽出口公网 IP
+incus exec 实例名 -- sh -lc 'curl -4 ifconfig.me'
+```
+
+4. 端口入口（可选）：
+
+默认两端都开启 `20000-30000` 的 TCP/UDP 整段预转发，家宽出口机会把这段端口的入口流量经隧道透传到普通节点，端口号保持不变。也就是说用户可以访问 `家宽公网IP:端口`，普通节点原有的面板/Incus 端口映射继续负责 `端口 -> 小鸡`。
+
+家宽端也支持手动单端口转发到指定小鸡：
+
+```bash
+sudo gre-home add tcp 25022 小鸡IP 22
+sudo gre-home del tcp 25022 小鸡IP 22
+```
+
+修改或关闭整段预转发（两端用相同参数）：
+
+```bash
+sudo PREFORWARD_RANGE=20000:30000 NODE_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-home.sh
+sudo PREFORWARD_ENABLE=0 NODE_PUBLIC_IP=普通节点公网IP GUEST_SUBNET=10.10.0.0/22 bash setup-gre-home.sh
+```
+
+5. 管理命令：
+
+家宽出口端：
+
+```bash
+sudo gre-home status
+sudo gre-home on
+sudo gre-home off
+sudo gre-home restart
+sudo gre-home repair
+sudo gre-home mtu        # 重新探测路径 MTU 并应用
+sudo gre-home logs -n 80
+```
+
+普通节点端：
+
+```bash
+sudo gre-node status
+sudo gre-node on
+sudo gre-node off
+sudo gre-node restart
+sudo gre-node repair
+sudo gre-node mtu        # 重新探测路径 MTU 并应用（两端需一致）
+sudo gre-node logs -n 80
+```
+
+两端各装一个 `*-check.timer`，每 60 秒自检：隧道设备、路由表/策略路由、SNAT/RETURN、MSS clamp、预转发规则丢失时自动补回；家宽机动态公网 IP、普通节点 WAN 变化、域名解析漂移也会被检测并重新应用。
+
+要点与排错：
+
+- **MTU 一致**：两端 `GRE_MTU` 必须相同。脚本默认 MSS 用 `--clamp-mss-to-pmtu` 跟随 MTU，无需手填 MSS。若小鸡能 ping 通但 HTTPS/TLS 卡住，多半是 MTU 偏大，两端一起 `sudo gre-home mtu` / `sudo gre-node mtu` 重探，或手动同时调小 `GRE_MTU` 重跑。
+- **incus 自带 NAT**：普通节点脚本默认 `DISABLE_INCUS_NAT=1`，会自动把 `incusbr0` 的 `ipv4.nat` 关掉。原因是 incus 给网桥装的 masquerade 没有出接口限制，会抢在隧道流量前把小鸡源 IP 改成隧道 IP（`10.255.1.2`），导致家宽端按小鸡网段做的 SNAT 不匹配、私网源 IP 出不去——表现为小鸡能 ping 通隧道却上不了公网。脚本会记录原值，`gre-node` 移除时自动恢复。设 `DISABLE_INCUS_NAT=0` 可跳过（需自行处理冲突）。
+- **入站回程**：普通节点用 connmark（从 WAN 进来的新连接打标 `0x1` + 策略路由 `fwmark 0x1 lookup main`）保证入站端口/SSH 的回程包原路从节点 WAN 出去，而小鸡主动发起的连接仍走家宽出口。
+- **小鸡网段唯一**：多个普通节点接同一家宽出口时，各节点小鸡网段不能重叠。
+
+
 
 如果 GRE 开启后小鸡访问 HTTPS/TLS 卡住，而关闭 `gre-be` 后立即恢复，优先改用 WireGuard 优化线路模式。它和 GRE 模式作用相同：小鸡仍创建在普通 Incus 节点，用户入口和小鸡出口走优化线路节点。
 
