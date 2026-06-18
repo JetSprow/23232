@@ -416,7 +416,9 @@ ${C_BLD}${C_CYN}egress-tune${C_RESET} — SOCKS5 出口自测/自调优
   ${C_BLD}9${C_RESET}) 回滚 egress-tune 的所有改动
   ${C_BLD}q${C_RESET}) 退出
 MENU
-    read -r -p "选择: " choice
+    if ! read -r -p "选择: " choice; then
+      echo; warn "输入结束(EOF),退出。"; exit 0
+    fi
     case "$choice" in
       1) run_all_diag ;;
       2) diag_buffers; diag_rtt ;;
@@ -447,6 +449,19 @@ MENU
 # =============================================================================
 main() {
   need_root
+  # 通过 `curl ... | sudo bash` 管道运行时,stdin 是脚本内容而非键盘,
+  # 会导致 read 立即读到空值、菜单死循环。这里把交互输入接回控制终端。
+  if [[ ! -t 0 ]]; then
+    if [[ -e /dev/tty ]]; then
+      exec < /dev/tty
+    else
+      echo "检测到非交互输入(可能是管道运行),且无可用终端。" >&2
+      echo "请改为先下载再运行:" >&2
+      echo "  curl -fsSL https://raw.githubusercontent.com/JetSprow/23232/main/egress-tune.sh -o egress-tune.sh" >&2
+      echo "  sudo bash egress-tune.sh" >&2
+      exit 1
+    fi
+  fi
   echo "${C_BLD}egress-tune.sh${C_RESET}  —  诊断默认只读,调优需确认且可回滚。"
   echo "目标脚本:setup-egress-socks.sh  |  上游配置:$CONFIG_FILE"
   if [[ ! -s "$CONFIG_FILE" ]]; then
