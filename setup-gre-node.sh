@@ -40,6 +40,11 @@ PREFORWARD_ENABLE="${PREFORWARD_ENABLE:-1}"
 PREFORWARD_RANGE="${PREFORWARD_RANGE:-20000:30000}"
 RMEM_MAX="${RMEM_MAX:-16777216}"
 WMEM_MAX="${WMEM_MAX:-16777216}"
+# 是否自动关闭 incusbr0 的自带 NAT。incus 默认给网桥装的 masquerade 没有出接口限制，
+# 会抢在本脚本的 RETURN 之前，把走 GRE 隧道的小鸡包源 IP 改成隧道 IP(10.255.1.2)，
+# 导致家宽端 SNAT(-s 小鸡网段) 不匹配、私网源 IP 出不去 -> 小鸡能 ping 通隧道但上不了公网。
+# 关掉后小鸡出口统一由家宽端 SNAT，这正是本方案期望的行为。设为 0 可跳过(自行处理冲突)。
+DISABLE_INCUS_NAT="${DISABLE_INCUS_NAT:-1}"
 
 valid_ip_or_host() { [[ -n "$1" && "$1" != *:* ]]; }
 
@@ -169,6 +174,17 @@ fi
 
 decide_mtu
 
+# 记录 incusbr0 当前的 ipv4.nat 原值，供卸载时恢复（仅首次安装时探测，避免覆盖已保存的原值）
+INCUS_NAT_ORIG="${INCUS_NAT_ORIG:-}"
+if [[ -z "$INCUS_NAT_ORIG" ]]; then
+  if command -v incus >/dev/null 2>&1; then
+    INCUS_NAT_ORIG="$(incus network get "$INCUS_BRIDGE" ipv4.nat 2>/dev/null || true)"
+    [[ -z "$INCUS_NAT_ORIG" ]] && INCUS_NAT_ORIG="true"   # incus 默认即为 true
+  else
+    INCUS_NAT_ORIG="unknown"
+  fi
+fi
+
 echo "==> 写入配置"
 mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
 cat > "$CONFIG_FILE" <<EOF
@@ -189,6 +205,8 @@ PREFORWARD_ENABLE=${PREFORWARD_ENABLE}
 PREFORWARD_RANGE=${PREFORWARD_RANGE}
 RMEM_MAX=${RMEM_MAX}
 WMEM_MAX=${WMEM_MAX}
+DISABLE_INCUS_NAT=${DISABLE_INCUS_NAT}
+INCUS_NAT_ORIG=${INCUS_NAT_ORIG}
 EOF
 chmod 600 "$CONFIG_FILE"
 
@@ -231,6 +249,20 @@ net.ipv4.conf.default.rp_filter=2
 SYSCTL
 sysctl -q --system >/dev/null 2>&1 || sysctl -q -p /etc/sysctl.d/98-gre-node.conf >/dev/null 2>&1 || true
 sysctl -qw net.ipv4.ip_forward=1 >/dev/null
+
+# 关闭 incusbr0 自带 NAT：incus 的 masquerade(table inet incus)无出接口限制，会抢在本机
+# RETURN 之前把走 GRE 的小鸡包源 IP 改成隧道 IP，导致家宽端 SNAT 不匹配、私网 IP 出不去。
+# 关掉后小鸡出口统一由家宽端 SNAT。幂等：每次 apply 都确保为 false。
+if [[ "${DISABLE_INCUS_NAT:-1}" == "1" ]] && command -v incus >/dev/null 2>&1; then
+  cur="$(incus network get "$INCUS_BRIDGE" ipv4.nat 2>/dev/null || true)"
+  if [[ "$cur" != "false" ]]; then
+    if incus network set "$INCUS_BRIDGE" ipv4.nat false 2>/dev/null; then
+      logger -t gre-node "已关闭 ${INCUS_BRIDGE} ipv4.nat (原值: ${cur:-true})，避免 incus masquerade 抢改隧道流量源IP"
+    else
+      logger -t gre-node "警告: 关闭 ${INCUS_BRIDGE} ipv4.nat 失败，小鸡可能因 incus masquerade 无法经隧道出网"
+    fi
+  fi
+fi
 
 ip tunnel del "$GRE_NAME" 2>/dev/null || true
 ip tunnel add "$GRE_NAME" mode gre local "$NODE_PUBLIC_IP" remote "$HOME_PUBLIC_IP" ttl 255
@@ -309,6 +341,10 @@ ip route show table "$GRE_TABLE" | grep -F "$GUEST_SUBNET" | grep -F "dev $INCUS
 ip rule show | grep -F "from $GUEST_SUBNET lookup $GRE_TABLE" >/dev/null || need_repair "missing guest ip rule"
 ip rule show | grep -F "from $NODE_TUN_IP lookup $GRE_TABLE" >/dev/null || need_repair "missing tunnel ip rule"
 ip rule show | grep -F "lookup main" | grep -F "0x1" >/dev/null || need_repair "missing inbound fwmark rule"
+# incus 自带 NAT 漂移检测：若被重新打开会再次抢改隧道流量源IP
+if [[ "${DISABLE_INCUS_NAT:-1}" == "1" ]] && command -v incus >/dev/null 2>&1; then
+  [[ "$(incus network get "$INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo false)" == "false" ]] || need_repair "${INCUS_BRIDGE} ipv4.nat re-enabled"
+fi
 iptables -C INPUT -p 47 -s "${resolved_home:-$HOME_PUBLIC_IP}" -j ACCEPT 2>/dev/null || need_repair "missing GRE input rule"
 iptables -C FORWARD -i "$INCUS_BRIDGE" -o "$GRE_NAME" -j ACCEPT 2>/dev/null || need_repair "missing guest->GRE forward"
 iptables -C FORWARD -i "$GRE_NAME" -o "$INCUS_BRIDGE" -j ACCEPT 2>/dev/null || need_repair "missing GRE->guest forward"
@@ -353,6 +389,15 @@ ip rule del from "$GUEST_SUBNET" table "$GRE_TABLE" pref "$GRE_RULE_PREF" 2>/dev
 ip route flush table "$GRE_TABLE" 2>/dev/null || true
 ip route flush cache 2>/dev/null || true
 ip tunnel del "$GRE_NAME" 2>/dev/null || true
+
+# 恢复 incusbr0 的 ipv4.nat 原值（卸载隧道后小鸡需要重新走本机 NAT 才能上网）
+if [[ "${DISABLE_INCUS_NAT:-1}" == "1" ]] && command -v incus >/dev/null 2>&1; then
+  case "${INCUS_NAT_ORIG:-true}" in
+    false) : ;;  # 原本就是 false，无需恢复
+    unknown) : ;;
+    *) incus network set "$INCUS_BRIDGE" ipv4.nat true 2>/dev/null && logger -t gre-node "已恢复 ${INCUS_BRIDGE} ipv4.nat=true" || true ;;
+  esac
+fi
 EOF
 chmod +x "$REMOVE_BIN"
 
@@ -417,7 +462,7 @@ chmod +x "$RESTART_BIN"
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=GRE node uplink to home egress
-After=network-online.target
+After=network-online.target incus.service
 Wants=network-online.target
 
 [Service]
@@ -476,6 +521,10 @@ echo " GRE MTU:      ${GRE_MTU}  (两端必须一致；MSS 自动 clamp)"
 echo " 小鸡网段:     ${GUEST_SUBNET}  经隧道走家宽出口"
 echo " Incus Bridge: ${INCUS_BRIDGE}"
 echo " 路由表/规则:  table ${GRE_TABLE} / pref ${GRE_RULE_PREF}"
+if [[ "${DISABLE_INCUS_NAT:-1}" == "1" ]]; then
+  echo " incus NAT:    已关闭 ${INCUS_BRIDGE} ipv4.nat (原值 ${INCUS_NAT_ORIG})，小鸡出口统一走家宽 SNAT"
+  echo "               卸载(gre-node off 不影响；重跑 remove)时自动恢复原值"
+fi
 echo "------------------------------------------------------------"
 echo " 验证隧道连通: ping -c3 ${HOME_TUN_IP}"
 echo " 验证小鸡出口IP(进任一小鸡内执行): curl -4 ifconfig.me"

@@ -111,9 +111,22 @@ if [[ "$ROLE" == "node" || "$ROLE" == "both" ]]; then
   run "iptables -t mangle -S PREROUTING | grep -E 'CONNMARK|0x1' || echo '（缺 connmark 规则）'"
   sec "[node] FORWARD 放行"
   run "iptables -S FORWARD | grep -E '$GRE_NAME|$INCUS_BRIDGE|$WAN_IF' || echo '（无相关规则）'"
-  sec "[node] incus 网络配置（看是否自带 ipv4.nat）"
+  sec "[node] incus 自带 NAT（关键：必须为 false，否则 incus masquerade 会抢改隧道流量源IP）"
   if command -v incus >/dev/null; then
+    natval="$(incus network get "$INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo '?')"
+    if [[ "$natval" == "false" ]]; then
+      ok "${INCUS_BRIDGE} ipv4.nat=false（正确，小鸡出口走家宽 SNAT）"
+    else
+      bad "${INCUS_BRIDGE} ipv4.nat=${natval}！incus masquerade 会把走隧道的小鸡包源IP改成隧道IP，"
+      echo "     导致家宽端 SNAT 不匹配、私网IP出不去 -> 小鸡能 ping 通隧道但上不了公网。"
+      echo "     修复: incus network set ${INCUS_BRIDGE} ipv4.nat false  （或重跑 setup-gre-node.sh）"
+    fi
+    if nft list ruleset 2>/dev/null | grep -A4 'pstrt.*'"$INCUS_BRIDGE" | grep -q masquerade; then
+      bad "nftables table inet incus 里仍有 ${INCUS_BRIDGE} 的 masquerade（无出接口限制，元凶规则还在）"
+    fi
     run "incus network show $INCUS_BRIDGE 2>/dev/null | grep -E 'ipv4|nat' || echo '（读不到，可能名字不同）'"
+  else
+    warn "未装 incus CLI，无法检查 ipv4.nat"
   fi
 fi
 
