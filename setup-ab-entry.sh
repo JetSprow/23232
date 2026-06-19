@@ -37,22 +37,64 @@ valid_range() {
   valid_port "$low" && valid_port "$high" && (( low <= high ))
 }
 
+# 从 apt 报错日志里提取坏源的主机/路径关键字（任何 "does not have a Release file"
+# 或 "Failed to fetch ... Release" 的第三方源），临时禁用对应 sources 文件后重试。
+# 比只认 bullseye-backports 更通用：ookla/speedtest、各类 packagecloud/ppa 坏源都能自愈。
+disable_broken_apt_repos() {
+  local log_file="$1" tokens=() tok file matched=0
+  while IFS= read -r tok; do
+    [[ -n "$tok" ]] && tokens+=("$tok")
+  done < <(grep -oiE "https?://[^ '\"]+" "$log_file" 2>/dev/null \
+            | sed -E 's#https?://##; s#/$##' | sort -u)
+  [[ ${#tokens[@]} -eq 0 ]] && return 1
+  echo "==> 检测到不可用的 APT 源，自动禁用后重试:"
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    for tok in "${tokens[@]}"; do
+      grep -qiF "$tok" "$file" || continue
+      cp -n "$file" "${file}.bak" 2>/dev/null || true
+      case "$file" in
+        *.sources) mv "$file" "${file}.disabled"; echo "   disabled: ${file} (${tok})" ;;
+        *) sed -i "\#${tok}#s/^[[:space:]]*\(deb\|deb-src\)[[:space:]]/# disabled by ab-entry setup: &/" "$file"; echo "   patched:  ${file} (${tok})" ;;
+      esac
+      matched=1
+      break
+    done
+  done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null)
+  [[ $matched -eq 1 ]] && return 0 || return 1
+}
+
+disable_broken_backports_repo() {
+  local file
+  echo "==> 检测到 bullseye-backports 源不可用，自动禁用后重试"
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    grep -qi 'bullseye-backports' "$file" || continue
+    cp -n "$file" "${file}.bak" 2>/dev/null || true
+    case "$file" in
+      *.sources) mv "$file" "${file}.disabled"; echo "   disabled: ${file}" ;;
+      *) sed -i '/bullseye-backports/s/^[[:space:]]*\(deb\|deb-src\)[[:space:]]/# disabled by ab-entry setup: &/' "$file"; echo "   patched:  ${file}" ;;
+    esac
+  done < <(find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null)
+}
+
 apt_update_with_repair() {
   local log_file="/tmp/ab-entry-apt-update.log"
   if apt-get update -qq >"$log_file" 2>&1; then
     rm -f "$log_file"
     return 0
   fi
-  if grep -qi 'bullseye-backports.*Release file' "$log_file"; then
+  # 第一轮：泛化禁用所有报错的坏源后重试
+  if disable_broken_apt_repos "$log_file"; then
+    if apt-get update -qq >"$log_file" 2>&1; then
+      rm -f "$log_file"
+      return 0
+    fi
+  fi
+  # 兜底：专门处理 bullseye-backports
+  if grep -qi 'bullseye-backports' "$log_file"; then
     cat "$log_file" >&2
-    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null | while read -r file; do
-      grep -qi 'bullseye-backports' "$file" || continue
-      cp -n "$file" "${file}.bak" 2>/dev/null || true
-      case "$file" in
-        *.sources) mv "$file" "${file}.disabled" ;;
-        *) sed -i '/bullseye-backports/s/^[[:space:]]*\(deb\|deb-src\)[[:space:]]/# disabled by ab-entry setup: &/' "$file" ;;
-      esac
-    done
+    disable_broken_backports_repo
     apt-get update -qq
     rm -f "$log_file"
     return 0
